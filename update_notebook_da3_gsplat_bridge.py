@@ -492,21 +492,5 @@ if insert_at is None:
 if not any("15.1 Verified DA3-to-gsplat Trainer Bridge" in "".join(c.get("source", [])) for c in cells):
     cells[insert_at:insert_at] = [md(bridge_md), code(bridge_code)]
 
-# Make the notebook attempt a short real A100 smoke run by default now that a verified bridge exists.
-for cell in cells:
-    if cell.get("cell_type") != "code":
-        continue
-    src = "".join(cell.get("source", []))
-    if "config = PipelineConfig(" in src:
-        src = src.replace('    job_id="test_run_001",\n', '    job_id="smoke_a100_001",\n')
-        src = src.replace("    frame_fps=2.0,\n", "    frame_fps=0.25,\n")
-        src = src.replace("    max_frames=600,\n", "    max_frames=12,\n")
-        src = src.replace("    resize_width=1008,\n", "    resize_width=504,\n")
-        src = src.replace("    resize_height=756,\n", "    resize_height=378,\n")
-        src = src.replace("    da3_mock_mode=False,\n    dry_run=True,\n)", "    da3_mock_mode=False,\n    gsplat_iterations=50,\n    dry_run=False,\n)")
-        src = src.replace("dry_run=True,\n)", "dry_run=False,\n)")
-        cell["source"] = src.splitlines(True)
-        break
-
 NB_PATH.write_text(json.dumps(nb, indent=2, ensure_ascii=False), encoding="utf-8")
 print(f"Updated {NB_PATH.resolve()}")

@@ -140,13 +140,14 @@ cells.append(code(r"""
 
 DA3_REPO_URL = "https://github.com/ByteDance-Seed/depth-anything-3"
 GSPLAT_REPO_URL = "https://github.com/nerfstudio-project/gsplat"
+VGGT_REPO_URL = "https://github.com/facebookresearch/vggt"
 
 
 @dataclass
 class PipelineConfig:
     use_drive: bool = True
     video_source: Literal["upload", "drive_path"] = "drive_path"
-    input_video_path: str = "/content/drive/MyDrive/input_video.mp4"
+    input_video_path: str = "/content/drive/MyDrive/da3_3dgs_colab/inputs/input_video.mp4"
     max_video_seconds: int = 300
 
     project_root: Optional[str] = None
@@ -177,11 +178,27 @@ class PipelineConfig:
     da3_device: str = "cuda"
     da3_use_ray_pose: bool = False
     da3_mock_mode: bool = False
+    da3_auto_restart_after_dependency_install: bool = True
     confidence_threshold: float = 0.5
+
+    vggt_repo_url: str = VGGT_REPO_URL
+    vggt_repo_dir: str = "/content/vggt"
+    vggt_repo_revision: str = ""
+    vggt_fallback_policy: Literal["off", "compare_only", "prefer_vggt_colmap"] = "compare_only"
+    vggt_use_ba: bool = False
+    vggt_fail_open: bool = True
+    vggt_scene_dir: str = ""
 
     point_stride: int = 4
     max_points: int = 1_000_000
     voxel_size: float = 0.01
+    wall_plane_filter_enabled: bool = True
+    wall_plane_min_luma: float = 175.0
+    wall_plane_max_chroma: float = 35.0
+    wall_plane_distance_threshold: float = 0.035
+    wall_plane_project_distance: float = 0.10
+    wall_plane_min_inliers: int = 4000
+    wall_plane_max_planes: int = 6
     extrinsics_type: Literal["w2c", "c2w"] = "w2c"
     camera_convention: str = "opencv"
 
@@ -204,6 +221,7 @@ class PipelineConfig:
         "ply_note": "This is a 3DGS Gaussian PLY, not a triangle mesh PLY.",
         "da3_repo_url": DA3_REPO_URL,
         "gsplat_repo_url": GSPLAT_REPO_URL,
+        "vggt_repo_url": VGGT_REPO_URL,
     })
 
     def __post_init__(self):
@@ -218,6 +236,8 @@ class PipelineConfig:
             raise ValueError(f"da3_repo_url must be {DA3_REPO_URL}")
         if self.gsplat_repo_url != GSPLAT_REPO_URL:
             raise ValueError(f"gsplat_repo_url must be {GSPLAT_REPO_URL}")
+        if self.vggt_repo_url != VGGT_REPO_URL:
+            raise ValueError(f"vggt_repo_url must be {VGGT_REPO_URL}")
 
     def refresh_paths(self):
         base = Path(self.project_root) / "outputs" / self.job_id
@@ -225,6 +245,7 @@ class PipelineConfig:
         self.work_dir = str(base / "work")
         self.frames_dir = str(base / "work" / "frames")
         self.da3_output_dir = str(base / "work" / "da3")
+        self.vggt_scene_dir = str(base / "work" / "vggt_scene")
         self.pointcloud_dir = str(base / "pointcloud")
         self.gsplat_dataset_dir = str(base / "work" / "gsplat_dataset")
         self.gsplat_train_dir = str(base / "work" / "gsplat_train")
@@ -251,18 +272,30 @@ def print_config(config: PipelineConfig):
 config = PipelineConfig(
     use_drive=True,
     video_source="drive_path",
-    input_video_path="/content/drive/MyDrive/input_video.mp4",
-    # First-pass A100 smoke validation: enough to verify every stage and final PLY export
-    # while spending minimal Colab Pro compute. Increase these after this run succeeds.
-    job_id="smoke_a100_001",
-    frame_fps=0.25,
-    max_frames=12,
-    resize_width=504,
-    resize_height=378,
+    input_video_path="/content/drive/MyDrive/da3_3dgs_colab/inputs/input_video.mp4",
+    job_id="corridor_vggt_wall_test_001",
+    frame_fps=1.0,
+    max_frames=180,
+    resize_width=1008,
+    resize_height=756,
     overwrite=False,
     resume=True,
+    confidence_threshold=0.55,
+    point_stride=3,
+    max_points=1_200_000,
+    voxel_size=0.008,
+    wall_plane_filter_enabled=True,
+    wall_plane_min_luma=170.0,
+    wall_plane_max_chroma=38.0,
+    wall_plane_distance_threshold=0.035,
+    wall_plane_project_distance=0.10,
+    wall_plane_min_inliers=2500,
+    wall_plane_max_planes=8,
+    vggt_fallback_policy="compare_only",
+    vggt_use_ba=False,
+    vggt_fail_open=True,
     da3_mock_mode=False,
-    gsplat_iterations=50,
+    gsplat_iterations=7000,
     dry_run=False,
 )
 
@@ -593,6 +626,57 @@ def run_shell(command, cwd=None, check=True):
     return result
 
 
+def restart_runtime_once_after_da3_dependency_install(config):
+    safe_job_id = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(config.job_id))
+    marker_path = Path("/tmp") / f".da3_dependency_runtime_restart_done_{safe_job_id}"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    if marker_path.exists() or not getattr(config, "da3_auto_restart_after_dependency_install", True):
+        return
+    marker_path.write_text(
+        "DA3 dependencies were installed in this Colab runtime and the Python process was restarted once to reload numpy/opencv native modules.\n",
+        encoding="utf-8",
+    )
+    print(
+        "\n[INFO] DA3 requirements changed numpy/opencv in the active Python runtime.\n"
+        "Colab must restart once before importing depth_anything_3.\n"
+        "The runtime will stop now. After it restarts, run the notebook again with the same job_id.\n"
+    )
+    import os
+    os.kill(os.getpid(), 9)
+
+
+def patch_xformers_triton_vararg_kernel():
+    try:
+        import xformers.triton.vararg_kernel as vararg_kernel
+    except Exception as exc:
+        print(f"[WARN] Could not import xformers.triton.vararg_kernel for compatibility patch: {exc!r}")
+        return False
+
+    patch_path = Path(vararg_kernel.__file__)
+    text = patch_path.read_text(encoding="utf-8")
+    old = "    jitted_fn.src = new_src\n    return jitted_fn\n"
+    new = (
+        "    if hasattr(jitted_fn, \"_unsafe_update_src\"):\n"
+        "        jitted_fn._unsafe_update_src(new_src)\n"
+        "        try:\n"
+        "            jitted_fn.hash = None\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "    else:\n"
+        "        jitted_fn.src = new_src\n"
+        "    return jitted_fn\n"
+    )
+    if new in text:
+        print(f"[OK] xformers/Triton compatibility patch already present: {patch_path}")
+        return True
+    if old not in text:
+        print(f"[WARN] xformers patch target not found in {patch_path}; leaving file unchanged.")
+        return False
+    patch_path.write_text(text.replace(old, new), encoding="utf-8")
+    print(f"[OK] Patched xformers/Triton compatibility issue: {patch_path}")
+    return True
+
+
 def setup_da3_repository(config):
     if config.da3_repo_url != EXPECTED_DA3_REPO_URL:
         raise ValueError(f"DA3 repo must be {EXPECTED_DA3_REPO_URL}")
@@ -628,6 +712,8 @@ def setup_da3_repository(config):
         run_shell(f"{sys.executable} -m pip install -r requirements.txt", cwd=DA3_REPO_DIR)
     if structure["pyproject_toml_exists"]:
         run_shell(f"{sys.executable} -m pip install -e .", cwd=DA3_REPO_DIR)
+    restart_runtime_once_after_da3_dependency_install(config)
+    patch_xformers_triton_vararg_kernel()
 
     for candidate in [DA3_REPO_DIR / "src", DA3_REPO_DIR]:
         if candidate.exists() and str(candidate) not in sys.path:
@@ -933,6 +1019,116 @@ except Exception:
 """))
 
 cells.append(md(r"""
+# 12.5 VGGT Geometry Fallback Probe
+
+Runs VGGT as an optional comparison/fallback route on the same extracted frames.
+
+Default policy is `compare_only`: VGGT writes a COLMAP-style scene under `work/vggt_scene`, but DA3 remains the primary route.
+
+Set `config.vggt_fallback_policy = "prefer_vggt_colmap"` before this cell to train gsplat from VGGT's COLMAP export instead of the DA3 bridge.
+"""))
+
+cells.append(code(r"""
+# ============================================================
+# 12.5 VGGT geometry fallback probe
+# ============================================================
+
+def vggt_status_path(config):
+    return Path(config.vggt_scene_dir) / "vggt_fallback_status.json"
+
+
+def write_vggt_status(config, status):
+    scene_dir = Path(config.vggt_scene_dir)
+    scene_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "policy": config.vggt_fallback_policy,
+        "scene_dir": str(scene_dir),
+        **status,
+    }
+    vggt_status_path(config).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return payload
+
+
+def prepare_vggt_scene(config):
+    scene_dir = Path(config.vggt_scene_dir)
+    images_dir = scene_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    frames = json.loads((Path(config.output_dir) / "frames.json").read_text(encoding="utf-8"))
+    copied = []
+    for idx, item in enumerate(frames):
+        src = Path(item["image_path"])
+        dst = images_dir / f"frame_{idx+1:06d}{src.suffix.lower()}"
+        if not dst.exists() or config.overwrite:
+            shutil.copy2(src, dst)
+        copied.append(str(dst))
+    return scene_dir, copied
+
+
+def setup_vggt_repo(config):
+    repo_dir = Path(config.vggt_repo_dir)
+    if repo_dir.exists():
+        print(f"VGGT repo exists: {repo_dir}")
+        if (repo_dir / ".git").exists() and config.repo_update_policy == "pull_latest":
+            run_shell("git pull", cwd=repo_dir, check=False)
+    else:
+        run_shell(f"git clone {config.vggt_repo_url} {repo_dir}", cwd="/content")
+    if config.vggt_repo_revision and (repo_dir / ".git").exists():
+        run_shell(f"git checkout {config.vggt_repo_revision}", cwd=repo_dir)
+    if (repo_dir / "requirements.txt").exists():
+        run_shell(f"{sys.executable} -m pip install -r requirements.txt", cwd=repo_dir)
+    return repo_dir
+
+
+def run_vggt_fallback_probe(config):
+    policy = getattr(config, "vggt_fallback_policy", "off")
+    if policy == "off":
+        return write_vggt_status(config, {"status": "skipped", "reason": "vggt_fallback_policy=off"})
+    try:
+        scene_dir, copied = prepare_vggt_scene(config)
+        sparse_dir = scene_dir / "sparse"
+        if config.resume and sparse_dir.exists() and any(sparse_dir.glob("**/*")) and not config.overwrite:
+            return write_vggt_status(config, {
+                "status": "reused",
+                "image_count": len(copied),
+                "sparse_dir": str(sparse_dir),
+            })
+        repo_dir = setup_vggt_repo(config)
+        command = f"{sys.executable} demo_colmap.py --scene_dir={scene_dir}"
+        if config.vggt_use_ba:
+            command += " --use_ba"
+        print("VGGT fallback command:")
+        print(command)
+        run_shell(command, cwd=repo_dir)
+        expected = [
+            sparse_dir / "cameras.bin",
+            sparse_dir / "images.bin",
+            sparse_dir / "points3D.bin",
+        ]
+        missing = [str(p) for p in expected if not p.exists()]
+        status = {
+            "status": "ok" if not missing else "incomplete",
+            "image_count": len(copied),
+            "sparse_dir": str(sparse_dir),
+            "missing": missing,
+            "note": "VGGT COLMAP export is a comparison/fallback route. DA3 remains primary unless vggt_fallback_policy='prefer_vggt_colmap'.",
+        }
+        if missing and not config.vggt_fail_open:
+            raise RuntimeError(f"VGGT COLMAP export missing files: {missing}")
+        return write_vggt_status(config, status)
+    except Exception as exc:
+        status = {"status": "failed", "error": repr(exc)}
+        write_vggt_status(config, status)
+        if not config.vggt_fail_open:
+            raise
+        print("VGGT fallback failed, but vggt_fail_open=True so the DA3 route will continue.")
+        return status
+
+
+vggt_fallback_status = run_vggt_fallback_probe(config)
+"""))
+
+cells.append(md(r"""
 # 13. Initial Point Cloud Generation
 
 Creates `outputs/{job_id}/pointcloud/init_points.ply` from DA3 depth and cameras.
@@ -987,6 +1183,94 @@ def unproject_depth_frame(depth, confidence, rgb, intrinsic, extrinsic, extrinsi
     return points[finite], colors[finite]
 
 
+def refine_low_texture_wall_planes(points, colors, config, o3d):
+    if not getattr(config, "wall_plane_filter_enabled", False):
+        return points, colors, {"enabled": False}
+    if len(points) < int(config.wall_plane_min_inliers):
+        return points, colors, {"enabled": True, "status": "skipped_too_few_points", "input_points": int(len(points))}
+
+    colors_f = colors.astype(np.float32)
+    luma = colors_f.mean(axis=1)
+    chroma = colors_f.max(axis=1) - colors_f.min(axis=1)
+    wall_mask = (luma >= float(config.wall_plane_min_luma)) & (chroma <= float(config.wall_plane_max_chroma))
+    wall_indices = np.flatnonzero(wall_mask)
+    if len(wall_indices) < int(config.wall_plane_min_inliers):
+        return points, colors, {
+            "enabled": True,
+            "status": "skipped_not_enough_wall_candidates",
+            "wall_candidate_points": int(len(wall_indices)),
+        }
+
+    wall_points = points[wall_indices]
+    wall_pcd = o3d.geometry.PointCloud()
+    wall_pcd.points = o3d.utility.Vector3dVector(wall_points.astype(np.float64))
+    remaining = wall_pcd
+    remaining_indices = wall_indices.copy()
+    planes = []
+
+    for _ in range(int(config.wall_plane_max_planes)):
+        if len(remaining_indices) < int(config.wall_plane_min_inliers):
+            break
+        plane_model, local_inliers = remaining.segment_plane(
+            distance_threshold=float(config.wall_plane_distance_threshold),
+            ransac_n=3,
+            num_iterations=1000,
+        )
+        local_inliers = np.asarray(local_inliers, dtype=np.int64)
+        if len(local_inliers) < int(config.wall_plane_min_inliers):
+            break
+        global_inliers = remaining_indices[local_inliers]
+        planes.append({
+            "model": np.asarray(plane_model, dtype=np.float32),
+            "inliers": global_inliers,
+        })
+        keep_local = np.ones(len(remaining_indices), dtype=bool)
+        keep_local[local_inliers] = False
+        remaining_indices = remaining_indices[keep_local]
+        remaining = remaining.select_by_index(local_inliers.tolist(), invert=True)
+
+    if not planes:
+        return points, colors, {
+            "enabled": True,
+            "status": "skipped_no_plane_found",
+            "wall_candidate_points": int(len(wall_indices)),
+        }
+
+    plane_models = np.stack([p["model"] for p in planes], axis=0)
+    normals = plane_models[:, :3]
+    offsets = plane_models[:, 3]
+    normal_norms = np.maximum(np.linalg.norm(normals, axis=1), 1e-6)
+    signed_dist = (wall_points @ normals.T + offsets[None, :]) / normal_norms[None, :]
+    nearest = np.argmin(np.abs(signed_dist), axis=1)
+    nearest_dist = signed_dist[np.arange(len(wall_points)), nearest]
+    near_plane = np.abs(nearest_dist) <= float(config.wall_plane_project_distance)
+
+    projected_wall_points = wall_points.copy()
+    for plane_idx in range(len(planes)):
+        mask = near_plane & (nearest == plane_idx)
+        if not np.any(mask):
+            continue
+        n = normals[plane_idx] / normal_norms[plane_idx]
+        projected_wall_points[mask] = wall_points[mask] - nearest_dist[mask, None] * n[None, :]
+
+    keep = np.ones(len(points), dtype=bool)
+    dropped_wall_indices = wall_indices[~near_plane]
+    keep[dropped_wall_indices] = False
+    refined_points = points.copy()
+    refined_points[wall_indices[near_plane]] = projected_wall_points[near_plane]
+    stats = {
+        "enabled": True,
+        "status": "ok",
+        "wall_candidate_points": int(len(wall_indices)),
+        "planes_found": int(len(planes)),
+        "plane_inliers": [int(len(p["inliers"])) for p in planes],
+        "projected_wall_points": int(np.count_nonzero(near_plane)),
+        "dropped_wall_outliers": int(len(dropped_wall_indices)),
+        "points_after_wall_filter": int(np.count_nonzero(keep)),
+    }
+    return refined_points[keep].astype(np.float32), colors[keep], stats
+
+
 def generate_initial_point_cloud(config):
     import open3d as o3d
     init_ply_path = POINTCLOUD_OUTPUT_DIR / "init_points.ply"
@@ -1017,6 +1301,7 @@ def generate_initial_point_cloud(config):
         idx = rng.choice(len(points), size=int(config.max_points), replace=False)
         points, colors = points[idx], colors[idx]
     after_sampling = len(points)
+    points, colors, wall_filter_stats = refine_low_texture_wall_planes(points, colors, config, o3d)
     if config.voxel_size and config.voxel_size > 0:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
@@ -1033,6 +1318,7 @@ def generate_initial_point_cloud(config):
         "note": "init_points.ply is a regular point cloud PLY for 3DGS initialization, not the final Gaussian PLY.",
         "points_before_sampling": int(before),
         "points_after_sampling": int(after_sampling),
+        "wall_plane_filter": wall_filter_stats,
         "points_after_voxel_downsample": int(len(points)),
         "init_ply_path": str(init_ply_path),
     }
@@ -1105,7 +1391,7 @@ def recover_config_for_gsplat_if_needed():
         if outputs.exists():
             candidates.extend(outputs.glob("*/config.json"))
 
-    preferred = drive_root / "outputs" / "smoke_a100_001" / "config.json"
+    preferred = drive_root / "outputs" / "corridor_vggt_wall_test_001" / "config.json"
     if preferred.exists():
         config_path = preferred
     elif candidates:
@@ -1361,6 +1647,18 @@ def build_gsplat_training_command(config):
     repo_dir = Path(config.gsplat_repo_dir)
     points_ply = dataset_dir / "points3D.ply"
     train_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(config, "vggt_fallback_policy", "off") == "prefer_vggt_colmap":
+        sparse_dir = Path(config.vggt_scene_dir) / "sparse"
+        required = [sparse_dir / "cameras.bin", sparse_dir / "images.bin", sparse_dir / "points3D.bin"]
+        missing = [str(p) for p in required if not p.exists()]
+        if missing:
+            raise FileNotFoundError(f"VGGT COLMAP fallback requested, but files are missing: {missing}")
+        return (
+            f"python {repo_dir}/examples/simple_trainer.py default "
+            f"--data_factor 1 "
+            f"--data_dir {Path(config.vggt_scene_dir)} "
+            f"--result_dir {train_dir}"
+        )
     return config.gsplat_command_template.format(
         dataset_dir=str(dataset_dir),
         train_dir=str(train_dir),
@@ -1371,6 +1669,9 @@ def build_gsplat_training_command(config):
 
 
 def validate_gsplat_training_route(config, inspection):
+    if getattr(config, "vggt_fallback_policy", "off") == "prefer_vggt_colmap":
+        print("Using VGGT COLMAP fallback route for gsplat training.")
+        return True
     command = config.gsplat_command_template
     uses_simple_trainer = "simple_trainer.py" in command
     if uses_simple_trainer and inspection.get("mentions_colmap") and not inspection.get("mentions_transforms_json"):
