@@ -1321,12 +1321,49 @@ else:
         "git clone --depth 1 https://github.com/maturk/dn-splatter /content/dn-splatter",
         log_path=Path(config.logs_dir) / "dn_git_clone.log",
     )
+
+# DN-Splatter's official pyproject declares vdbfusion as a required dependency.
+# PyPI does not publish a CPython 3.12 vdbfusion wheel for current Colab runtimes.
+# vdbfusion is used by triangle-mesh TSDF export, not by DN-Splatter training or
+# Nerfstudio Gaussian PLY export. Install the pinned training core explicitly,
+# then register the official repository without resolving mesh-only dependencies.
 run_command(
-    f"{shlex.quote(sys.executable)} -m pip install -e .",
+    (
+        f"{shlex.quote(sys.executable)} -m pip install "
+        "\"nerfstudio==1.1.3\" \"gsplat==1.0.0\" "
+        "\"black==22.3.0\" natsort pytest geffnet"
+    ),
+    log_path=Path(config.logs_dir) / "pip_install_dn_splatter_training_core.log",
+)
+run_command(
+    f"{shlex.quote(sys.executable)} -m pip install -e . --no-deps",
     cwd=dn_repo_dir,
     log_path=Path(config.logs_dir) / "pip_install_dn_splatter.log",
 )
+
+# DN-Splatter imports Omnidata predictor modules while registering dataparsers,
+# even when sensor-depth normal supervision is used and no mono normals are generated.
+omnidata_repo_dir = Path("/content/omnidata")
+if (omnidata_repo_dir / ".git").exists():
+    run_command("git pull --ff-only", cwd=omnidata_repo_dir, log_path=Path(config.logs_dir) / "omnidata_git_pull.log")
+else:
+    run_command(
+        "git clone --depth 1 https://github.com/EPFL-VILAB/omnidata /content/omnidata",
+        log_path=Path(config.logs_dir) / "omnidata_git_clone.log",
+    )
+site_packages_dir = Path(
+    capture_command(
+        f"{shlex.quote(sys.executable)} -c \"import site; print(site.getsitepackages()[0])\""
+    ).strip().splitlines()[-1]
+)
+omnidata_pth_path = site_packages_dir / "dn_splatter_omnidata.pth"
+omnidata_pth_path.write_text(str(omnidata_repo_dir) + "\n", encoding="utf-8")
+print("Registered Omnidata Python path:", omnidata_pth_path)
 print("Official pyproject pins: nerfstudio==1.1.3 and gsplat==1.0.0")
+print("Skipped vdbfusion: unavailable for Colab CPython 3.12 and only needed for triangle-mesh TSDF export.")
+print("Installed geffnet: imported by DN-Splatter DSINE registration even when depth normal supervision is selected.")
+print("Registered EPFL-VILAB/omnidata: imported by DN-Splatter Omnidata registration even when mono normals are not generated.")
+print("Pipeline artifact remains Gaussian PLY, not triangle mesh.")
 """
     ),
     md("## 16. DN-Splatter CLI Validation"),
