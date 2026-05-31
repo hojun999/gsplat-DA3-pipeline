@@ -315,6 +315,88 @@ def find_stray_export_root(root):
     raise RuntimeError(f"Multiple Stray Scanner exports found under {root}: {matches}")
 
 
+def copy_export_to_local_cache(source_root, cache_root, refresh=False):
+    source_root = Path(source_root)
+    cache_root = Path(cache_root)
+    complete_marker = cache_root / ".stray_export_cache_complete.json"
+    if refresh and cache_root.exists():
+        shutil.rmtree(cache_root)
+    if complete_marker.exists():
+        print("Using completed local Stray export cache:", cache_root)
+        return cache_root
+    cache_root.mkdir(parents=True, exist_ok=True)
+    try:
+        source_files = sorted(path for path in source_root.rglob("*") if path.is_file())
+    except OSError as exc:
+        raise RuntimeError(
+            "Google Drive mount became unavailable while listing the Stray export. "
+            "Remount Drive, then rerun this Step 4 cell. Existing local cache files will be reused. "
+            f"Original error: {exc!r}"
+        ) from exc
+    if not source_files:
+        raise RuntimeError(f"No files found while caching Stray export: {source_root}")
+    total_files = len(source_files)
+    progress_every = max(1, min(100, total_files // 20 or 1))
+    started = time.time()
+    copied_files = 0
+    reused_files = 0
+    print(f"[Step 4] Caching {total_files} files from Drive. Progress prints every {progress_every} file(s).")
+    for processed_count, source_path in enumerate(source_files, start=1):
+        relative_path = source_path.relative_to(source_root)
+        target_path = cache_root / relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            source_size = source_path.stat().st_size
+            if target_path.exists() and target_path.stat().st_size == source_size:
+                reused_files += 1
+            else:
+                last_error = None
+                for attempt in range(1, 4):
+                    try:
+                        shutil.copy2(source_path, target_path)
+                        last_error = None
+                        copied_files += 1
+                        break
+                    except OSError as exc:
+                        last_error = exc
+                        print(f"[Step 4] Copy retry {attempt}/3 for {relative_path}: {exc}")
+                        time.sleep(attempt * 2)
+                if last_error is not None:
+                    raise last_error
+        except OSError as exc:
+            raise RuntimeError(
+                "Google Drive mount became unavailable while copying the Stray export. "
+                f"Stopped at file {processed_count}/{total_files}: {relative_path}. "
+                "The partial local cache was preserved. Remount Drive, then rerun this Step 4 cell "
+                "to resume without recopying completed files. "
+                f"Original error: {exc!r}"
+            ) from exc
+        if processed_count == 1 or processed_count % progress_every == 0 or processed_count == total_files:
+            elapsed = time.time() - started
+            rate = processed_count / elapsed if elapsed > 0 else 0.0
+            remaining = total_files - processed_count
+            eta_seconds = remaining / rate if rate > 0 else None
+            eta_text = f"{eta_seconds / 60:.1f} min" if eta_seconds is not None else "unknown"
+            print(
+                f"[Step 4] {processed_count}/{total_files} ({processed_count / total_files * 100:.1f}%) | "
+                f"copied={copied_files} | reused={reused_files} | "
+                f"elapsed={elapsed / 60:.1f} min | ETA={eta_text}"
+            )
+    complete_marker.write_text(
+        json.dumps(
+            {
+                "source_root": str(source_root),
+                "cached_file_count": total_files,
+                "completed_at": datetime.now().isoformat(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print("Completed local Stray export cache:", cache_root)
+    return cache_root
+
+
 def prepare_stray_export(config):
     print("[Step 4] Preparing Stray Scanner export input")
     if config.stray_export_source == "drive_path":
@@ -342,14 +424,9 @@ def prepare_stray_export(config):
         raise ValueError("config.stray_export_source must be 'drive_path' or 'upload_zip'.")
     if config.local_cache_mode == "full_export" and config.stray_export_source == "drive_path":
         cache_root = Path(config.local_export_cache_dir)
-        if cache_root.exists() and config.refresh_local_cache:
-            shutil.rmtree(cache_root)
-        if cache_root.exists():
-            print("Using existing local Stray export cache:", cache_root)
-        else:
-            print("Copying Stray export from Drive to Colab local scratch:", cache_root)
-            print("This one-time cache copy can take several minutes for thousands of small files.")
-            shutil.copytree(root, cache_root)
+        print("Copying or resuming Stray export cache from Drive to Colab local scratch:", cache_root)
+        print("This one-time cache copy can take several minutes for thousands of small files.")
+        cache_root = copy_export_to_local_cache(root, cache_root, refresh=config.refresh_local_cache)
         root = find_stray_export_root(cache_root)
     elif config.local_cache_mode != "rgb_only":
         raise ValueError("config.local_cache_mode must be 'rgb_only' or 'full_export'.")
