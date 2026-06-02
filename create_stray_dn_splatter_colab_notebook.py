@@ -41,6 +41,8 @@ Verified repository HEAD commits: Stray Scanner `ec3e1dc9d33f8df2289ede6a5c59f79
 
 Important adapter note: current Stray Scanner documentation describes 16-bit millimeter `depth/*.png`, `confidence/*.png`, and headered `odometry.csv`. The official repository also contains an older integration script that reads sequential pose arrays and `depth/*.npy`. This notebook records the detected variant in its manifest and supports both documented PNG depth and legacy NPY depth without silently inventing missing inputs.
 
+The default `selected_frames` cache strategy copies `rgb.mp4` and CSV metadata first, filters local RGB frames, and copies only the depth/confidence files needed by the selected RGB/pose candidates. This avoids copying thousands of unused sensor PNG files from Google Drive.
+
 Run cells from top to bottom in a fresh Google Colab A100 runtime.
 """
     ),
@@ -219,8 +221,10 @@ class PipelineConfig:
     resume: bool = True
     dry_run: bool = True
     project_root: Optional[str] = None
-    local_cache_mode: Literal["rgb_only", "full_export"] = "rgb_only"
+    local_cache_mode: Literal["selected_frames", "full_export"] = "selected_frames"
     refresh_local_cache: bool = False
+    selected_frame_candidate_multiplier: float = 1.5
+    selected_frame_candidate_min_extra: int = 60
 
     min_selected_frames: int = 24
     pointcloud_depth_stride: int = 8
@@ -254,6 +258,8 @@ class PipelineConfig:
         self.result_dir = str(Path(self.job_root) / "result_package")
         self.upload_extract_dir = str(scratch / "uploaded_stray_export")
         self.local_export_cache_dir = str(scratch / "stray_export")
+        self.local_metadata_cache_dir = str(scratch / "stray_metadata")
+        self.local_selected_sensor_cache_dir = str(scratch / "selected_sensor_frames")
         return self
 
 
@@ -281,6 +287,8 @@ for path in [
     config.reports_dir,
     config.runtime_scratch_dir,
     config.rgb_extract_dir,
+    config.local_metadata_cache_dir,
+    config.local_selected_sensor_cache_dir,
     config.dn_output_dir,
     config.gaussian_export_dir,
     config.result_dir,
@@ -397,6 +405,48 @@ def copy_export_to_local_cache(source_root, cache_root, refresh=False):
     return cache_root
 
 
+def copy_metadata_to_local_cache(source_root, cache_root, refresh=False):
+    source_root = Path(source_root)
+    cache_root = Path(cache_root)
+    if refresh and cache_root.exists():
+        shutil.rmtree(cache_root)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    prepared = {}
+    names = ["rgb.mp4", "odometry.csv", "imu.csv", "camera_matrix.csv"]
+    print("[Step 4] Preparing RGB video and CSV metadata in Colab local scratch.")
+    for index, name in enumerate(names, start=1):
+        source_path = source_root / name
+        target_path = cache_root / name
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Missing required Stray Scanner export file: {name}")
+        try:
+            source_size = source_path.stat().st_size
+            if target_path.exists() and target_path.stat().st_size == source_size:
+                status = "reused"
+            else:
+                shutil.copy2(source_path, target_path)
+                status = "copied"
+        except OSError as exc:
+            raise RuntimeError(
+                "Google Drive mount became unavailable while preparing Stray RGB and metadata. "
+                f"Failed file: {name}. Remount Drive, then rerun this Step 4 cell. "
+                f"Original error: {exc!r}"
+            ) from exc
+        prepared[name] = target_path
+        print(f"[Step 4] {index}/{len(names)} ({index / len(names) * 100:.1f}%) | {status}: {name}")
+    return prepared
+
+
+def paths_from_export_root(root):
+    root = Path(root)
+    return {
+        "rgb.mp4": root / "rgb.mp4",
+        "odometry.csv": root / "odometry.csv",
+        "imu.csv": root / "imu.csv",
+        "camera_matrix.csv": root / "camera_matrix.csv",
+    }
+
+
 def prepare_stray_export(config):
     print("[Step 4] Preparing Stray Scanner export input")
     if config.stray_export_source == "drive_path":
@@ -428,13 +478,23 @@ def prepare_stray_export(config):
         print("This one-time cache copy can take several minutes for thousands of small files.")
         cache_root = copy_export_to_local_cache(root, cache_root, refresh=config.refresh_local_cache)
         root = find_stray_export_root(cache_root)
-    elif config.local_cache_mode != "rgb_only":
-        raise ValueError("config.local_cache_mode must be 'rgb_only' or 'full_export'.")
+        prepared_paths = paths_from_export_root(root)
+    elif config.local_cache_mode == "selected_frames" and config.stray_export_source == "drive_path":
+        prepared_paths = copy_metadata_to_local_cache(
+            root,
+            Path(config.local_metadata_cache_dir),
+            refresh=config.refresh_local_cache,
+        )
+    elif config.stray_export_source == "upload_zip":
+        prepared_paths = paths_from_export_root(root)
+    else:
+        raise ValueError("config.local_cache_mode must be 'selected_frames' or 'full_export'.")
     print("Stray export root:", root)
-    return root
+    print("Sensor cache strategy:", config.local_cache_mode)
+    return root, prepared_paths
 
 
-stray_export_root = prepare_stray_export(config)
+stray_export_root, prepared_stray_paths = prepare_stray_export(config)
 """
     ),
     md("## 5. Export Discovery And Manifest"),
@@ -494,10 +554,14 @@ def discover_stray_export(config):
             "files": required_files,
             "directories": [f"{name}/" for name in required_dirs],
         },
-        "rgb_video_path": str(root / "rgb.mp4"),
-        "odometry_csv_path": str(root / "odometry.csv"),
-        "imu_csv_path": str(root / "imu.csv"),
-        "camera_matrix_csv_path": str(root / "camera_matrix.csv"),
+        "rgb_video_path": str(prepared_stray_paths["rgb.mp4"]),
+        "odometry_csv_path": str(prepared_stray_paths["odometry.csv"]),
+        "imu_csv_path": str(prepared_stray_paths["imu.csv"]),
+        "camera_matrix_csv_path": str(prepared_stray_paths["camera_matrix.csv"]),
+        "source_rgb_video_path": str(root / "rgb.mp4"),
+        "source_odometry_csv_path": str(root / "odometry.csv"),
+        "source_imu_csv_path": str(root / "imu.csv"),
+        "source_camera_matrix_csv_path": str(root / "camera_matrix.csv"),
         "depth_directory": str(root / "depth"),
         "confidence_directory": str(root / "confidence"),
         "optional_distortion_directory": str(distortion_dir) if distortion_dir.is_dir() else None,
@@ -509,6 +573,7 @@ def discover_stray_export(config):
         "depth_files": {str(key): str(value) for key, value in depth_files.items()},
         "confidence_files": {str(key): str(value) for key, value in confidence_files.items()},
         "distortion_files": distortion_files,
+        "sensor_cache_strategy": config.local_cache_mode,
         "official_documented_depth_unit": "millimeters",
         "official_documented_confidence_values": [0, 1, 2],
         "adapter_note": "Current docs use PNG. Official repository integration script also contains a legacy NPY reader.",
@@ -755,23 +820,15 @@ def align_stray_frames(odometry, camera_matrix, rgb_files, depth_files, confiden
     progress_every = max(1, min(100, total_common_ids // 20 or 1))
     alignment_started = time.time()
     print(
-        f"[Step 7] Aligning {total_common_ids} common frames. "
+        f"[Step 7] Aligning {total_common_ids} common RGB/pose/path records without opening depth pixels. "
         f"Progress will print every {progress_every} frame(s)."
     )
     for processed_count, frame_id in enumerate(common_ids, start=1):
         row = odometry_by_id[frame_id]
         try:
             rgb = cv2.imread(str(rgb_files[frame_id]), cv2.IMREAD_COLOR)
-            depth_shape = load_array_shape(depth_files[frame_id])
-            confidence_shape = load_array_shape(confidence_files[frame_id])
             if rgb is None:
                 raise RuntimeError(f"Could not read extracted RGB frame: {rgb_files[frame_id]}")
-            if len(depth_shape) != 2:
-                raise RuntimeError(f"Depth frame must be single-channel: {depth_files[frame_id]} shape={depth_shape}")
-            if len(confidence_shape) != 2:
-                raise RuntimeError(
-                    f"Confidence frame must be single-channel: {confidence_files[frame_id]} shape={confidence_shape}"
-                )
             intrinsic, intrinsic_source = row_intrinsic(row, camera_matrix)
             pose_c2w = pose_from_odometry_row(row, config.pose_conversion)
         except Exception as exc:
@@ -795,10 +852,10 @@ def align_stray_frames(odometry, camera_matrix, rgb_files, depth_files, confiden
                 intrinsic=intrinsic,
                 width=int(rgb.shape[1]),
                 height=int(rgb.shape[0]),
-                depth_width=int(depth_shape[1]),
-                depth_height=int(depth_shape[0]),
-                confidence_width=int(confidence_shape[1]),
-                confidence_height=int(confidence_shape[0]),
+                depth_width=0,
+                depth_height=0,
+                confidence_width=0,
+                confidence_height=0,
             ))
         if processed_count == 1 or processed_count % progress_every == 0 or processed_count == total_common_ids:
             elapsed = time.time() - alignment_started
@@ -828,10 +885,10 @@ alignment_warnings = []
 if not timestamp_monotonic:
     alignment_warnings.append("Aligned timestamps are not monotonic.")
 if len(aligned_records) != len(candidate_ids_before_rgb):
-    alignment_warnings.append("Some common frame ids could not be aligned. Inspect failed RGB extraction and unreadable data.")
+    alignment_warnings.append("Some common frame ids could not be aligned. Inspect failed RGB extraction and invalid pose data.")
 if unreadable_required_data_frames:
     alignment_warnings.append(
-        f"Skipped {len(unreadable_required_data_frames)} frame(s) with unreadable or invalid required data."
+        f"Skipped {len(unreadable_required_data_frames)} frame(s) with unreadable RGB or invalid pose data."
     )
 
 alignment_report = {
@@ -892,7 +949,7 @@ def validate_minimum_format(aligned_records, odometry_df, camera_matrix, alignme
 minimum_validation = validate_minimum_format(aligned_records, odometry_df, camera_matrix, alignment_report)
 """
     ),
-    md("## 9-12. Blur, Similarity, Pose Baseline, And max_frames Filtering"),
+    md("## 9-12. RGB Filtering, Selected Sensor Cache, And max_frames Selection"),
     code(
         r"""
 def blur_score(image_path, method):
@@ -937,6 +994,12 @@ def pose_delta(previous_pose, current_pose):
 def frame_depth_confidence_metrics(record, config):
     depth = load_array(record.depth_path).astype(np.float64)
     confidence = load_array(record.confidence_path)
+    if depth.ndim != 2:
+        raise RuntimeError(f"Depth frame must be single-channel: {record.depth_path} shape={depth.shape}")
+    if confidence.ndim != 2:
+        raise RuntimeError(f"Confidence frame must be single-channel: {record.confidence_path} shape={confidence.shape}")
+    record.depth_height, record.depth_width = int(depth.shape[0]), int(depth.shape[1])
+    record.confidence_height, record.confidence_width = int(confidence.shape[0]), int(confidence.shape[1])
     depth_m = depth * config.depth_unit_scale_factor
     finite = np.isfinite(depth_m)
     valid_depth = finite & (depth_m >= config.depth_min_m) & (depth_m <= config.depth_max_m)
@@ -947,21 +1010,29 @@ def frame_depth_confidence_metrics(record, config):
     }
 
 
-def filter_frames(records, config):
-    print("[Steps 9-12] Filtering frames: blur -> similarity -> pose baseline -> max_frames")
-    selected = []
+def selected_sensor_candidate_limit(config):
+    if config.max_frames is None:
+        return None
+    return max(
+        config.max_frames + config.selected_frame_candidate_min_extra,
+        int(math.ceil(config.max_frames * config.selected_frame_candidate_multiplier)),
+    )
+
+
+def select_rgb_pose_candidates(records, config):
+    print("[Steps 9-12] Filtering local RGB frames: blur -> similarity -> pose baseline -> candidate limit")
+    candidates = []
     rows = []
     last_selected_hash = None
     last_selected_pose = None
+    candidate_limit = selected_sensor_candidate_limit(config)
     for record in records:
         score = blur_score(record.rgb_path, config.blur_score_method)
         current_hash = phash_bits(record.rgb_path)
         similarity = similarity_score(last_selected_hash, current_hash, config.similarity_method)
         translation, rotation = pose_delta(last_selected_pose, record.pose_c2w)
         rejection_reason = None
-        metrics = {"valid_depth_ratio": None, "confidence_ratio": None}
-        required_data_error = None
-        if config.max_frames is not None and len(selected) >= config.max_frames:
+        if candidate_limit is not None and len(candidates) >= candidate_limit:
             rejection_reason = "max_frames_limit"
         elif score < config.min_blur_score:
             rejection_reason = "blur_too_low"
@@ -972,20 +1043,9 @@ def filter_frames(records, config):
             and rotation < config.min_rotation_baseline_deg
         ):
             rejection_reason = "pose_baseline_too_small"
-        else:
-            try:
-                metrics = frame_depth_confidence_metrics(record, config)
-                if metrics["valid_depth_ratio"] < config.min_valid_depth_ratio:
-                    rejection_reason = "invalid_depth"
-                elif metrics["confidence_ratio"] < config.min_confidence_ratio:
-                    rejection_reason = "invalid_confidence"
-            except Exception as exc:
-                rejection_reason = "missing_required_data"
-                required_data_error = str(exc)
-                print(f"Skipping unreadable required-data frame {record.frame_id}: {exc}")
-        is_selected = rejection_reason is None
-        if is_selected:
-            selected.append(record)
+        is_candidate = rejection_reason is None
+        if is_candidate:
+            candidates.append(record)
             last_selected_hash = current_hash
             last_selected_pose = record.pose_c2w
         rows.append({
@@ -995,12 +1055,125 @@ def filter_frames(records, config):
             "similarity_score": similarity,
             "translation_from_last_selected_m": translation,
             "rotation_from_last_selected_deg": rotation,
+            "valid_depth_ratio": None,
+            "confidence_ratio": None,
+            "candidate_selected": is_candidate,
+            "selected": False,
+            "rejection_reason": rejection_reason,
+            "required_data_error": None,
+        })
+    print(f"RGB/pose candidates selected for sensor caching: {len(candidates)}")
+    return candidates, rows
+
+
+def copy_sensor_file_to_local(source_path, target_path):
+    source_path = Path(source_path)
+    target_path = Path(target_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    source_size = source_path.stat().st_size
+    if target_path.exists() and target_path.stat().st_size == source_size:
+        return "reused"
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            shutil.copy2(source_path, target_path)
+            return "copied"
+        except OSError as exc:
+            last_error = exc
+            print(f"[Steps 9-12] Sensor copy retry {attempt}/3 for {source_path.name}: {exc}")
+            time.sleep(attempt * 2)
+    raise last_error
+
+
+def cache_candidate_sensor_frames(records, config):
+    cache_root = Path(config.local_selected_sensor_cache_dir)
+    if cache_root.exists() and config.refresh_local_cache:
+        shutil.rmtree(cache_root)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    failures = {}
+    total = len(records)
+    progress_every = max(1, min(25, total // 20 or 1))
+    started = time.time()
+    copied = 0
+    reused = 0
+    print(f"[Steps 9-12] Caching depth/confidence for {total} RGB/pose candidates.")
+    for processed_count, record in enumerate(records, start=1):
+        try:
+            source_depth = Path(record.depth_path)
+            source_confidence = Path(record.confidence_path)
+            target_depth = cache_root / "depth" / source_depth.name
+            target_confidence = cache_root / "confidence" / source_confidence.name
+            statuses = [
+                copy_sensor_file_to_local(source_depth, target_depth),
+                copy_sensor_file_to_local(source_confidence, target_confidence),
+            ]
+            copied += statuses.count("copied")
+            reused += statuses.count("reused")
+            record.depth_path = str(target_depth)
+            record.confidence_path = str(target_confidence)
+        except OSError as exc:
+            if "Transport endpoint is not connected" in str(exc):
+                raise RuntimeError(
+                    "Google Drive mount became unavailable while copying selected depth/confidence frames. "
+                    "The partial local sensor cache was preserved. Remount Drive, then rerun this filter cell. "
+                    f"Stopped at frame_id={record.frame_id}. Original error: {exc!r}"
+                ) from exc
+            failures[record.frame_id] = str(exc)
+            print(f"Skipping sensor-cache frame {record.frame_id}: {exc}")
+        if processed_count == 1 or processed_count % progress_every == 0 or processed_count == total:
+            elapsed = time.time() - started
+            rate = processed_count / elapsed if elapsed > 0 else 0.0
+            remaining = total - processed_count
+            eta_seconds = remaining / rate if rate > 0 else None
+            eta_text = f"{eta_seconds / 60:.1f} min" if eta_seconds is not None else "unknown"
+            print(
+                f"[Steps 9-12] sensor cache {processed_count}/{total} ({processed_count / total * 100:.1f}%) | "
+                f"copied={copied} | reused={reused} | failures={len(failures)} | "
+                f"elapsed={elapsed / 60:.1f} min | ETA={eta_text}"
+            )
+    return failures
+
+
+def finalize_sensor_candidates(candidates, rows, config):
+    failures = cache_candidate_sensor_frames(candidates, config)
+    row_by_frame_id = {row["frame_id"]: row for row in rows}
+    selected = []
+    for record in candidates:
+        row = row_by_frame_id[record.frame_id]
+        rejection_reason = None
+        required_data_error = failures.get(record.frame_id)
+        metrics = {"valid_depth_ratio": None, "confidence_ratio": None}
+        if required_data_error is not None:
+            rejection_reason = "missing_required_data"
+        else:
+            try:
+                metrics = frame_depth_confidence_metrics(record, config)
+                if metrics["valid_depth_ratio"] < config.min_valid_depth_ratio:
+                    rejection_reason = "invalid_depth"
+                elif metrics["confidence_ratio"] < config.min_confidence_ratio:
+                    rejection_reason = "invalid_confidence"
+                elif config.max_frames is not None and len(selected) >= config.max_frames:
+                    rejection_reason = "max_frames_limit"
+            except Exception as exc:
+                rejection_reason = "missing_required_data"
+                required_data_error = str(exc)
+                print(f"Skipping unreadable required-data frame {record.frame_id}: {exc}")
+        is_selected = rejection_reason is None
+        if is_selected:
+            selected.append(record)
+        row.update({
             "valid_depth_ratio": metrics["valid_depth_ratio"],
             "confidence_ratio": metrics["confidence_ratio"],
             "selected": is_selected,
             "rejection_reason": rejection_reason,
             "required_data_error": required_data_error,
         })
+    return selected, rows
+
+
+def filter_frames(records, config):
+    candidates, rows = select_rgb_pose_candidates(records, config)
+    selected, rows = finalize_sensor_candidates(candidates, rows, config)
     missing_required_rows = [{
         "frame_id": frame_id,
         "timestamp": None,
@@ -1010,6 +1183,7 @@ def filter_frames(records, config):
         "rotation_from_last_selected_deg": None,
         "valid_depth_ratio": None,
         "confidence_ratio": None,
+        "candidate_selected": False,
         "selected": False,
         "rejection_reason": "missing_required_data",
         "required_data_error": "Frame could not be aligned because at least one required modality was absent or invalid.",
@@ -1017,17 +1191,26 @@ def filter_frames(records, config):
     report_rows = sorted(rows + missing_required_rows, key=lambda row: row["frame_id"])
     counts = Counter(row["rejection_reason"] for row in report_rows if row["rejection_reason"])
     report = {
-        "filter_order": ["blur", "similarity", "pose_baseline", "max_frames"],
+        "filter_order": [
+            "blur",
+            "similarity",
+            "pose_baseline",
+            "selected_depth_confidence_local_cache",
+            "depth_confidence_validation",
+            "max_frames",
+        ],
         "thresholds": {
             "min_blur_score": config.min_blur_score,
             "max_similarity": config.max_similarity,
             "min_translation_baseline_m": config.min_translation_baseline_m,
             "min_rotation_baseline_deg": config.min_rotation_baseline_deg,
             "max_frames": config.max_frames,
+            "selected_sensor_candidate_limit": selected_sensor_candidate_limit(config),
         },
         "summary": {
             "total_aligned_frames": len(records),
             "total_candidate_frame_ids": len(report_rows),
+            "rgb_pose_candidates_cached": len(candidates),
             "selected_frames": len(selected),
             "rejected_aligned_frames": len(records) - len(selected),
             "missing_required_data_frames": len(missing_required_rows),
