@@ -204,6 +204,15 @@ class PipelineConfig:
     vggt_fallback_policy: Literal["off", "compare_only", "prefer_vggt_colmap"] = "compare_only"
     vggt_use_ba: bool = False
     vggt_fail_open: bool = True
+    vggt_auto_fallback_on_da3_failure: bool = True
+    vggt_confidence_thresholds: List[float] = field(default_factory=lambda: [5.0, 1.0, 0.2])
+    vggt_refine_sparse_scene: bool = True
+    vggt_sparse_axis_clip_quantile: float = 0.002
+    vggt_sparse_path_distance_mad_multiplier: float = 6.0
+    vggt_sparse_min_filtered_points: int = 10_000
+    vggt_sparse_min_retained_ratio: float = 0.25
+    vggt_pose_step_mad_multiplier: float = 6.0
+    vggt_max_pose_jump_ratio: float = 0.15
     vggt_scene_dir: str = ""
 
     point_stride: int = 4
@@ -331,6 +340,15 @@ config = PipelineConfig(
     vggt_fallback_policy="compare_only",
     vggt_use_ba=False,
     vggt_fail_open=True,
+    vggt_auto_fallback_on_da3_failure=True,
+    vggt_confidence_thresholds=[5.0, 1.0, 0.2],
+    vggt_refine_sparse_scene=True,
+    vggt_sparse_axis_clip_quantile=0.002,
+    vggt_sparse_path_distance_mad_multiplier=6.0,
+    vggt_sparse_min_filtered_points=10_000,
+    vggt_sparse_min_retained_ratio=0.25,
+    vggt_pose_step_mad_multiplier=6.0,
+    vggt_max_pose_jump_ratio=0.15,
     da3_mock_mode=False,
     gsplat_iterations=7000,
     dry_run=False,
@@ -563,6 +581,28 @@ from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 
 
+def read_frame_with_fallback(cap, target_index, source_frame_count, search_radius=8):
+    target_index = int(target_index)
+    source_frame_count = int(source_frame_count)
+    offsets = [0]
+    for delta in range(1, int(search_radius) + 1):
+        offsets.extend([-delta, delta])
+    tried = []
+    for offset in offsets:
+        frame_index = target_index + offset
+        if frame_index < 0 or frame_index >= source_frame_count:
+            continue
+        tried.append(frame_index)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, bgr = cap.read()
+        if ok and bgr is not None:
+            return frame_index, bgr
+    raise ValueError(
+        f"Failed to read frame {target_index} and nearby frames {tried}. "
+        "The video may be truncated or corrupted around this position."
+    )
+
+
 def extract_candidate_video_frames(config, input_video_path):
     candidate_dir = Path(config.candidate_frames_dir)
     candidate_dir.mkdir(parents=True, exist_ok=True)
@@ -573,6 +613,8 @@ def extract_candidate_video_frames(config, input_video_path):
             print(f"Using existing candidate frames: {candidates_json_path}")
             return candidates
     cap = cv2.VideoCapture(str(input_video_path))
+    if not cap.isOpened():
+        raise ValueError(f"OpenCV could not open video: {input_video_path}")
     source_fps = float(cap.get(cv2.CAP_PROP_FPS))
     source_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if source_fps <= 0 or source_frame_count <= 0:
@@ -588,21 +630,29 @@ def extract_candidate_video_frames(config, input_video_path):
     indices = np.unique(indices)
 
     candidates = []
-    for output_index, frame_index in enumerate(tqdm(indices, desc="Extracting candidate frames"), start=1):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
-        ok, bgr = cap.read()
-        if not ok or bgr is None:
+    decoded_frame_indices = set()
+    fallback_count = 0
+    for requested_frame_index in tqdm(indices, desc="Extracting candidate frames"):
+        try:
+            frame_index, bgr = read_frame_with_fallback(cap, requested_frame_index, source_frame_count)
+        except ValueError:
             cap.release()
-            raise ValueError(f"Failed to read frame {frame_index}")
+            raise
+        if frame_index in decoded_frame_indices:
+            continue
+        decoded_frame_indices.add(frame_index)
+        if frame_index != int(requested_frame_index):
+            fallback_count += 1
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         if config.resize_width and config.resize_height:
             rgb = cv2.resize(rgb, (int(config.resize_width), int(config.resize_height)), interpolation=cv2.INTER_AREA)
         height, width = rgb.shape[:2]
-        image_path = candidate_dir / f"candidate_{output_index:06d}.jpg"
+        image_path = candidate_dir / f"candidate_{len(candidates) + 1:06d}.jpg"
         Image.fromarray(rgb).save(image_path, quality=95)
         candidates.append({
             "image_path": str(image_path),
             "original_frame_index": int(frame_index),
+            "requested_frame_index": int(requested_frame_index),
             "timestamp_sec": float(frame_index) / source_fps,
             "width": int(width),
             "height": int(height),
@@ -610,6 +660,8 @@ def extract_candidate_video_frames(config, input_video_path):
     cap.release()
     candidates_json_path.write_text(json.dumps(candidates, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Saved {len(candidates)} candidate frames and {candidates_json_path}")
+    if fallback_count:
+        print(f"Recovered {fallback_count} unreadable sampled frames using nearby decodable frames.")
     return candidates
 
 
@@ -1458,11 +1510,16 @@ try:
     da3_validation = validate_da3_results(config)
     refined_geometry_report = evaluate_da3_geometry(config, config.da3_output_dir, "refined")
     if refined_geometry_report["anomaly_ratio"] > float(config.geometry_refined_max_anomaly_ratio):
-        raise RuntimeError(
+        message = (
             "Refined DA3 geometry still contains too many anomalies: "
-            f"{refined_geometry_report['anomaly_ratio']:.1%} > {config.geometry_refined_max_anomaly_ratio:.1%}. "
-            "Inspect the refined trajectory and depth consistency report before gsplat training."
+            f"{refined_geometry_report['anomaly_ratio']:.1%} > {config.geometry_refined_max_anomaly_ratio:.1%}."
         )
+        if getattr(config, "vggt_auto_fallback_on_da3_failure", True):
+            config.vggt_fallback_policy = "prefer_vggt_colmap"
+            print("[WARN]", message)
+            print("[WARN] Switching automatically to VGGT COLMAP fallback. Continue with section 12.5.")
+        else:
+            raise RuntimeError(message + " Inspect the refined trajectory and depth consistency report before gsplat training.")
     preview_depth_maps(config)
 except Exception:
     print("DA3 validation failed. Check DA3 repo install, checkpoint/HF ID, import, and prediction fields.")
@@ -1529,7 +1586,39 @@ def setup_vggt_repo(config):
         run_shell(f"git checkout {config.vggt_repo_revision}", cwd=repo_dir)
     if (repo_dir / "requirements.txt").exists():
         run_shell(f"{sys.executable} -m pip install -r requirements.txt", cwd=repo_dir)
+    run_shell(
+        f"{sys.executable} -m pip install pycolmap==3.10.0 pyceres==2.3 hydra-core omegaconf "
+        "\"git+https://github.com/jytime/LightGlue.git#egg=lightglue\"",
+        cwd=repo_dir,
+    )
     return repo_dir
+
+
+def ply_vertex_count(path):
+    path = Path(path)
+    if not path.exists():
+        return 0
+    with path.open("rb") as f:
+        for raw_line in f:
+            line = raw_line.decode("ascii", errors="ignore").strip()
+            if line.startswith("element vertex "):
+                return int(line.split()[-1])
+            if line == "end_header":
+                break
+    return 0
+
+
+def validate_vggt_sparse_scene(sparse_dir):
+    sparse_dir = Path(sparse_dir)
+    expected = [
+        sparse_dir / "cameras.bin",
+        sparse_dir / "images.bin",
+        sparse_dir / "points3D.bin",
+        sparse_dir / "points.ply",
+    ]
+    missing = [str(path) for path in expected if not path.exists()]
+    point_count = ply_vertex_count(sparse_dir / "points.ply")
+    return missing, point_count
 
 
 def run_vggt_fallback_probe(config):
@@ -1540,33 +1629,44 @@ def run_vggt_fallback_probe(config):
         scene_dir, copied = prepare_vggt_scene(config)
         sparse_dir = scene_dir / "sparse"
         if config.resume and sparse_dir.exists() and any(sparse_dir.glob("**/*")) and not config.overwrite:
-            return write_vggt_status(config, {
-                "status": "reused",
-                "image_count": len(copied),
-                "sparse_dir": str(sparse_dir),
-            })
+            missing, point_count = validate_vggt_sparse_scene(sparse_dir)
+            if not missing and point_count > 0:
+                return write_vggt_status(config, {
+                    "status": "reused",
+                    "image_count": len(copied),
+                    "sparse_dir": str(sparse_dir),
+                    "point_count": point_count,
+                })
+            print(f"Existing VGGT sparse scene is incomplete or empty; rebuilding it. missing={missing}, point_count={point_count}")
         repo_dir = setup_vggt_repo(config)
-        command = f"{sys.executable} demo_colmap.py --scene_dir={scene_dir}"
-        if config.vggt_use_ba:
-            command += " --use_ba"
-        print("VGGT fallback command:")
-        print(command)
-        run_shell(command, cwd=repo_dir)
-        expected = [
-            sparse_dir / "cameras.bin",
-            sparse_dir / "images.bin",
-            sparse_dir / "points3D.bin",
-        ]
-        missing = [str(p) for p in expected if not p.exists()]
+        missing = []
+        point_count = 0
+        selected_threshold = None
+        for threshold in config.vggt_confidence_thresholds:
+            if sparse_dir.exists():
+                shutil.rmtree(sparse_dir)
+            command = f"{sys.executable} demo_colmap.py --scene_dir={scene_dir} --conf_thres_value={float(threshold)}"
+            if config.vggt_use_ba:
+                command += " --use_ba"
+            print("VGGT fallback command:")
+            print(command)
+            run_shell(command, cwd=repo_dir)
+            missing, point_count = validate_vggt_sparse_scene(sparse_dir)
+            if not missing and point_count > 0:
+                selected_threshold = float(threshold)
+                break
+            print(f"VGGT sparse export was empty or incomplete at confidence threshold {threshold}: missing={missing}, point_count={point_count}")
         status = {
-            "status": "ok" if not missing else "incomplete",
+            "status": "ok" if not missing and point_count > 0 else "incomplete",
             "image_count": len(copied),
             "sparse_dir": str(sparse_dir),
             "missing": missing,
+            "point_count": point_count,
+            "selected_confidence_threshold": selected_threshold,
             "note": "VGGT COLMAP export is a comparison/fallback route. DA3 remains primary unless vggt_fallback_policy='prefer_vggt_colmap'.",
         }
-        if missing and not config.vggt_fail_open:
-            raise RuntimeError(f"VGGT COLMAP export missing files: {missing}")
+        if (missing or point_count <= 0) and (not config.vggt_fail_open or policy == "prefer_vggt_colmap"):
+            raise RuntimeError(f"VGGT COLMAP export is incomplete or empty: missing={missing}, point_count={point_count}")
         return write_vggt_status(config, status)
     except Exception as exc:
         status = {"status": "failed", "error": repr(exc)}
@@ -1578,6 +1678,206 @@ def run_vggt_fallback_probe(config):
 
 
 vggt_fallback_status = run_vggt_fallback_probe(config)
+"""))
+
+cells.append(md(r"""
+# 12.6 VGGT Sparse Scene Refinement
+
+Validates the VGGT camera trajectory and writes a conservative `sparse/training_points.ply` for gsplat initialization.
+
+The original VGGT `points.ply` remains untouched for comparison. The refined point cloud removes non-finite points, robust spatial outliers, and points unusually far from the estimated camera path. This limits wall-penetrating depth tails before Gaussian densification.
+"""))
+
+cells.append(code(r"""
+# ============================================================
+# 12.6 VGGT sparse scene refinement
+# ============================================================
+
+def vggt_robust_upper_threshold(values, multiplier, absolute_floor=0.0):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return float(absolute_floor)
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    return max(float(absolute_floor), median + float(multiplier) * max(mad, 1e-12))
+
+
+def load_ply_xyz_rgb(path):
+    from plyfile import PlyData
+
+    vertex = PlyData.read(str(path))["vertex"].data
+    names = set(vertex.dtype.names or [])
+    points = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float64)
+    if {"red", "green", "blue"}.issubset(names):
+        colors = np.stack([vertex["red"], vertex["green"], vertex["blue"]], axis=1).astype(np.uint8)
+    else:
+        colors = np.full((len(points), 3), 127, dtype=np.uint8)
+    return points, colors
+
+
+def write_ply_xyz_rgb(path, points, colors):
+    from plyfile import PlyData, PlyElement
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    vertex = np.empty(
+        len(points),
+        dtype=[("x", "f4"), ("y", "f4"), ("z", "f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")],
+    )
+    vertex["x"], vertex["y"], vertex["z"] = points[:, 0], points[:, 1], points[:, 2]
+    vertex["red"], vertex["green"], vertex["blue"] = colors[:, 0], colors[:, 1], colors[:, 2]
+    PlyData([PlyElement.describe(vertex, "vertex")], text=False).write(str(path))
+
+
+def load_vggt_camera_centers(sparse_dir):
+    import pycolmap
+
+    reconstruction = pycolmap.Reconstruction(str(sparse_dir))
+    centers = []
+    names = []
+    for image_id in sorted(reconstruction.images):
+        image = reconstruction.images[image_id]
+        cam_from_world = image.cam_from_world
+        if callable(cam_from_world):
+            cam_from_world = cam_from_world()
+        if cam_from_world is None:
+            continue
+        matrix = np.asarray(cam_from_world.matrix(), dtype=np.float64)
+        rotation = matrix[:3, :3]
+        translation = matrix[:3, 3]
+        centers.append(-rotation.T @ translation)
+        names.append(image.name)
+    if not centers:
+        raise ValueError(f"No registered cameras in VGGT reconstruction: {sparse_dir}")
+    return np.stack(centers), names
+
+
+def nearest_camera_path_distances(points, camera_centers, chunk_size=20_000):
+    distances = []
+    for start in range(0, len(points), int(chunk_size)):
+        chunk = points[start : start + int(chunk_size)]
+        squared = np.sum((chunk[:, None, :] - camera_centers[None, :, :]) ** 2, axis=2)
+        distances.append(np.sqrt(np.min(squared, axis=1)))
+    return np.concatenate(distances) if distances else np.empty((0,), dtype=np.float64)
+
+
+def preview_vggt_sparse_refinement(source_points, filtered_points, camera_centers, save_path, max_points=20_000):
+    import matplotlib.pyplot as plt
+
+    rng = np.random.default_rng(42)
+    source_ids = rng.choice(len(source_points), size=min(len(source_points), int(max_points)), replace=False)
+    filtered_ids = rng.choice(len(filtered_points), size=min(len(filtered_points), int(max_points)), replace=False)
+    fig = plt.figure(figsize=(16, 7))
+    for position, title, points in [
+        (121, "VGGT source points", source_points[source_ids]),
+        (122, "VGGT refined training points", filtered_points[filtered_ids]),
+    ]:
+        ax = fig.add_subplot(position, projection="3d")
+        ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=0.4, alpha=0.35)
+        ax.plot(camera_centers[:, 0], camera_centers[:, 1], camera_centers[:, 2], color="red", linewidth=1.5)
+        ax.set_title(title)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160)
+    plt.show()
+
+
+def refine_vggt_sparse_scene(config):
+    policy = getattr(config, "vggt_fallback_policy", "off")
+    if policy == "off":
+        print("VGGT refinement skipped because vggt_fallback_policy=off.")
+        return None
+    fallback_status = globals().get("vggt_fallback_status", {})
+    if policy == "compare_only" and fallback_status.get("status") not in {"ok", "reused"}:
+        print(f"Optional VGGT refinement skipped because fallback status is {fallback_status.get('status')!r}.")
+        return None
+    sparse_dir = Path(config.vggt_scene_dir) / "sparse"
+    source_ply = sparse_dir / "points.ply"
+    output_ply = sparse_dir / "training_points.ply"
+    report_path = Path(config.reports_dir) / "vggt_sparse_refinement_report.json"
+    if not source_ply.exists():
+        raise FileNotFoundError(f"Missing VGGT source point cloud: {source_ply}")
+
+    points, colors = load_ply_xyz_rgb(source_ply)
+    camera_centers, camera_names = load_vggt_camera_centers(sparse_dir)
+    if len(points) == 0:
+        raise ValueError(f"VGGT source point cloud is empty: {source_ply}")
+
+    finite = np.isfinite(points).all(axis=1)
+    finite_points = points[finite]
+    finite_colors = colors[finite]
+    if len(finite_points) == 0:
+        raise ValueError(f"VGGT source point cloud has no finite points: {source_ply}")
+
+    step_distances = np.linalg.norm(np.diff(camera_centers, axis=0), axis=1)
+    step_threshold = vggt_robust_upper_threshold(step_distances, config.vggt_pose_step_mad_multiplier)
+    pose_jump_indices = (np.flatnonzero(step_distances > step_threshold) + 1).tolist()
+    pose_jump_ratio = len(pose_jump_indices) / max(1, len(camera_centers))
+    camera_extent = float(np.max(np.linalg.norm(camera_centers - np.mean(camera_centers, axis=0), axis=1)))
+
+    if not getattr(config, "vggt_refine_sparse_scene", True):
+        shutil.copy2(source_ply, output_ply)
+        print(f"VGGT sparse refinement disabled; copied source point cloud to {output_ply}")
+        return output_ply
+
+    center = np.median(finite_points, axis=0)
+    _, _, vh = np.linalg.svd(camera_centers - np.median(camera_centers, axis=0), full_matrices=True)
+    aligned = (finite_points - center) @ vh.T
+    q = float(config.vggt_sparse_axis_clip_quantile)
+    if not 0.0 <= q < 0.5:
+        raise ValueError(f"vggt_sparse_axis_clip_quantile must be in [0, 0.5), got {q}")
+    lower = np.quantile(aligned, q, axis=0)
+    upper = np.quantile(aligned, 1.0 - q, axis=0)
+    within_axis_bounds = np.all((aligned >= lower) & (aligned <= upper), axis=1)
+
+    path_distances = nearest_camera_path_distances(finite_points, camera_centers)
+    path_distance_threshold = vggt_robust_upper_threshold(
+        path_distances,
+        config.vggt_sparse_path_distance_mad_multiplier,
+    )
+    near_camera_path = path_distances <= path_distance_threshold
+    keep = within_axis_bounds & near_camera_path
+    filtered_points = finite_points[keep].astype(np.float32)
+    filtered_colors = finite_colors[keep]
+    retained_ratio = len(filtered_points) / len(points)
+
+    report = {
+        "source_ply": str(source_ply),
+        "training_ply": str(output_ply),
+        "source_point_count": int(len(points)),
+        "finite_point_count": int(len(finite_points)),
+        "filtered_point_count": int(len(filtered_points)),
+        "retained_ratio": float(retained_ratio),
+        "camera_count": int(len(camera_centers)),
+        "camera_names": camera_names,
+        "camera_step_distance_threshold": float(step_threshold),
+        "camera_extent": camera_extent,
+        "camera_pose_jump_indices": pose_jump_indices,
+        "camera_pose_jump_ratio": float(pose_jump_ratio),
+        "path_distance_threshold": float(path_distance_threshold),
+        "axis_clip_quantile": q,
+        "status": "ok",
+    }
+    if camera_extent <= 1e-6:
+        report["status"] = "rejected_camera_extent"
+    elif len(filtered_points) < int(config.vggt_sparse_min_filtered_points):
+        report["status"] = "rejected_too_few_points"
+    elif retained_ratio < float(config.vggt_sparse_min_retained_ratio):
+        report["status"] = "rejected_low_retained_ratio"
+    elif pose_jump_ratio > float(config.vggt_max_pose_jump_ratio):
+        report["status"] = "rejected_pose_jump_ratio"
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps({key: value for key, value in report.items() if key != "camera_names"}, indent=2))
+    if report["status"] != "ok":
+        raise RuntimeError(f"VGGT sparse refinement rejected training input: {report['status']}. Inspect {report_path}")
+    write_ply_xyz_rgb(output_ply, filtered_points, filtered_colors)
+    preview_path = Path(config.reports_dir) / "vggt_sparse_refinement_preview.png"
+    preview_vggt_sparse_refinement(finite_points, filtered_points, camera_centers, preview_path)
+    print(f"VGGT refined training point cloud: {output_ply}")
+    print(f"VGGT sparse refinement preview: {preview_path}")
+    return output_ply
+
+
+vggt_training_points_path = refine_vggt_sparse_scene(config)
 """))
 
 cells.append(md(r"""
@@ -2168,7 +2468,7 @@ def setup_gsplat_repository(config):
         skipped_requirements = []
         kept_lines = []
         for line in requirements_path.read_text(encoding="utf-8").splitlines():
-            if "ppisp" in line.lower():
+            if "ppisp" in line.lower() or "rmbrualla/pycolmap" in line.lower():
                 skipped_requirements.append(line)
                 continue
             kept_lines.append(line)
@@ -2176,6 +2476,47 @@ def setup_gsplat_repository(config):
         print("Installing gsplat example requirements with optional ppisp skipped.")
         print("Skipped requirement lines:", skipped_requirements)
         run_shell(f"{sys.executable} -m pip install -r {filtered_requirements}", cwd=GSPLAT_REPO_DIR)
+    run_shell(f"{sys.executable} -m pip install numpy==1.26.4", cwd="/content")
+    run_shell(
+        f"{sys.executable} -m pip install --no-deps --force-reinstall "
+        "\"git+https://github.com/rmbrualla/pycolmap@cc7ea4b7301720ac29287dbe450952511b32125e\"",
+        cwd="/content",
+    )
+    colmap_loader = examples_dir / "datasets" / "colmap.py"
+    if colmap_loader.exists():
+        loader_text = colmap_loader.read_text(encoding="utf-8")
+        loader_text = loader_text.replace(
+            "from pycolmap import SceneManager",
+            "from pycolmap.scene_manager import SceneManager",
+        )
+        if "from plyfile import PlyData" not in loader_text:
+            loader_text = loader_text.replace(
+                "import numpy as np\n",
+                "import numpy as np\nfrom plyfile import PlyData\n",
+            )
+        original_points_loader = (
+            "        points = manager.points3D.astype(np.float32)\n"
+            "        points_err = manager.point3D_errors.astype(np.float32)\n"
+            "        points_rgb = manager.point3D_colors.astype(np.uint8)\n"
+        )
+        refined_points_loader = original_points_loader + (
+            "        refined_points_path = os.path.join(colmap_dir, \"training_points.ply\")\n"
+            "        if os.path.exists(refined_points_path):\n"
+            "            vertex = PlyData.read(refined_points_path)[\"vertex\"].data\n"
+            "            points = np.stack([vertex[\"x\"], vertex[\"y\"], vertex[\"z\"]], axis=1).astype(np.float32)\n"
+            "            points_rgb = np.stack([vertex[\"red\"], vertex[\"green\"], vertex[\"blue\"]], axis=1).astype(np.uint8)\n"
+            "            points_err = np.zeros((len(points),), dtype=np.float32)\n"
+            "            print(f\"[Parser] Using refined VGGT training points: {refined_points_path} ({len(points)} points)\")\n"
+        )
+        if "Using refined VGGT training points" not in loader_text:
+            if original_points_loader not in loader_text:
+                raise RuntimeError(f"Could not patch refined VGGT point loader in {colmap_loader}")
+            loader_text = loader_text.replace(original_points_loader, refined_points_loader)
+        colmap_loader.write_text(loader_text, encoding="utf-8")
+    trainer_text = simple.read_text(encoding="utf-8")
+    trainer_text = trainer_text.replace("disable_video: bool = False", "disable_video: bool = True")
+    trainer_text = trainer_text.replace("save_ply: bool = False", "save_ply: bool = True")
+    simple.write_text(trainer_text, encoding="utf-8")
     install_mode = "pypi_requested" if config.install_gsplat_from_pip else "unknown"
     if not config.install_gsplat_from_pip and ((GSPLAT_REPO_DIR / "pyproject.toml").exists() or (GSPLAT_REPO_DIR / "setup.py").exists()):
         editable_result = run_shell(f"{sys.executable} -m pip install -e .", cwd=GSPLAT_REPO_DIR, check=False)
@@ -2338,10 +2679,25 @@ def build_gsplat_training_command(config):
     train_dir.mkdir(parents=True, exist_ok=True)
     if getattr(config, "vggt_fallback_policy", "off") == "prefer_vggt_colmap":
         sparse_dir = Path(config.vggt_scene_dir) / "sparse"
-        required = [sparse_dir / "cameras.bin", sparse_dir / "images.bin", sparse_dir / "points3D.bin"]
+        required = [
+            sparse_dir / "cameras.bin",
+            sparse_dir / "images.bin",
+            sparse_dir / "points3D.bin",
+            sparse_dir / "points.ply",
+            sparse_dir / "training_points.ply",
+        ]
         missing = [str(p) for p in required if not p.exists()]
         if missing:
             raise FileNotFoundError(f"VGGT COLMAP fallback requested, but files are missing: {missing}")
+        point_count = ply_vertex_count(sparse_dir / "points.ply")
+        if point_count <= 0:
+            raise ValueError(f"VGGT COLMAP fallback requested, but the sparse point cloud is empty: {sparse_dir / 'points.ply'}")
+        training_point_count = ply_vertex_count(sparse_dir / "training_points.ply")
+        if training_point_count <= 0:
+            raise ValueError(
+                "VGGT sparse refinement did not create a usable training point cloud. "
+                "Run section 12.6 before gsplat training."
+            )
         return (
             f"python {repo_dir}/examples/simple_trainer.py default "
             f"--data_factor 1 "
