@@ -72,6 +72,7 @@ Run order:
 13. Initial point cloud generation
 14. gsplat repository setup
 15. DA3-to-gsplat dataset conversion
+15.2 Scene scale and pose diagnostics
 16. gsplat training
 17. Final Gaussian PLY export / download / debug utilities
 """))
@@ -239,12 +240,14 @@ class PipelineConfig:
     install_gsplat_from_pip: bool = False
     gsplat_repo_dir: str = "/content/gsplat"
     gsplat_iterations: int = 7000
+    gsplat_save_steps: Optional[List[int]] = None
     gsplat_command_template: str = (
         "python {repo_dir}/examples/da3_trainer.py "
         "--dataset-dir {dataset_dir} "
         "--train-dir {train_dir} "
         "--iterations {iterations} "
-        "--points-ply {points_ply}"
+        "--points-ply {points_ply} "
+        "--save-steps {save_steps}"
     )
     dry_run: bool = True
 
@@ -351,6 +354,7 @@ config = PipelineConfig(
     vggt_max_pose_jump_ratio=0.15,
     da3_mock_mode=False,
     gsplat_iterations=7000,
+    gsplat_save_steps=[2000, 5000, 7000],
     dry_run=False,
 )
 
@@ -2644,6 +2648,160 @@ transforms_json_path, points3d_ply_path = convert_da3_to_gsplat_dataset(config)
 """))
 
 cells.append(md(r"""
+# 15.2 Scene Scale And Pose Diagnostics
+
+Computes a data-driven scene scale report before training. This keeps DA3 world scale unchanged while making scale, pose jump, and point-cloud spread visible.
+"""))
+
+cells.append(code(r"""
+# ============================================================
+# 15.2 Scene scale and pose diagnostics
+# ============================================================
+
+import numpy as np
+
+
+def load_ply_xyz_for_diagnostics(path):
+    from plyfile import PlyData
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    vertex = PlyData.read(str(path))["vertex"].data
+    return np.stack(
+        [
+            np.asarray(vertex["x"], dtype=np.float64),
+            np.asarray(vertex["y"], dtype=np.float64),
+            np.asarray(vertex["z"], dtype=np.float64),
+        ],
+        axis=1,
+    )
+
+
+def vector_summary(values):
+    values = np.asarray(values, dtype=np.float64)
+    return {
+        "min": values.min(axis=0).round(6).tolist(),
+        "max": values.max(axis=0).round(6).tolist(),
+        "range": np.ptp(values, axis=0).round(6).tolist(),
+        "center": values.mean(axis=0).round(6).tolist(),
+    }
+
+
+def summarize_step_distances(positions):
+    if len(positions) < 2:
+        return {
+            "count": 0,
+            "mean": 0.0,
+            "median": 0.0,
+            "max": 0.0,
+            "robust_jump_threshold": 0.0,
+            "jump_indices": [],
+            "jump_ratio": 0.0,
+            "trajectory_length": 0.0,
+        }
+    distances = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+    median = float(np.median(distances))
+    mad = float(np.median(np.abs(distances - median)))
+    threshold = median + 6.0 * max(mad, 1e-12)
+    jump_indices = (np.flatnonzero(distances > threshold) + 1).astype(int).tolist()
+    return {
+        "count": int(distances.size),
+        "mean": float(distances.mean()),
+        "median": median,
+        "max": float(distances.max()),
+        "robust_jump_threshold": float(threshold),
+        "jump_indices": jump_indices,
+        "jump_ratio": float(len(jump_indices) / max(1, len(positions))),
+        "trajectory_length": float(distances.sum()),
+    }
+
+
+def diagnose_scene_scale_and_poses(config):
+    dataset_dir = Path(config.gsplat_dataset_dir)
+    reports_dir = Path(config.reports_dir)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    transforms = json.loads((dataset_dir / "transforms.json").read_text(encoding="utf-8"))
+    frames = transforms.get("frames", [])
+    if not frames:
+        raise ValueError("transforms.json has no frames.")
+
+    camera_positions = np.array(
+        [np.asarray(frame["transform_matrix"], dtype=np.float64)[:3, 3] for frame in frames],
+        dtype=np.float64,
+    )
+    points_path = dataset_dir / "points3D.ply"
+    points = load_ply_xyz_for_diagnostics(points_path)
+
+    camera_center = camera_positions.mean(axis=0)
+    points_center = points.mean(axis=0)
+    camera_extent = float(np.linalg.norm(camera_positions - camera_center, axis=1).max())
+    point_extent = float(np.linalg.norm(points - points_center, axis=1).max())
+    computed_scene_scale = float(max(camera_extent, point_extent * 0.1, 1e-3))
+    step_summary = summarize_step_distances(camera_positions)
+    diagonal = float(np.linalg.norm(np.ptp(camera_positions, axis=0)))
+    recommended_scale_from_path = float(max(diagonal * 1.5, 1e-3))
+
+    warnings = []
+    if step_summary["jump_ratio"] > 0.05:
+        warnings.append("camera_pose_jump_ratio_gt_0.05")
+    if computed_scene_scale <= 1e-3:
+        warnings.append("computed_scene_scale_too_small")
+    if not np.isfinite(points).all():
+        warnings.append("pointcloud_contains_non_finite_values")
+
+    report = {
+        "frame_count": len(frames),
+        "point_count": int(points.shape[0]),
+        "normalize_world_space": False,
+        "auto_scale_poses": False,
+        "scale_policy": "keep_da3_world_scale_and_compute_scene_scale_from_camera_and_points",
+        "camera_positions": vector_summary(camera_positions),
+        "pointcloud": vector_summary(points),
+        "camera_extent": camera_extent,
+        "point_extent": point_extent,
+        "computed_scene_scale": computed_scene_scale,
+        "trajectory_diagonal": diagonal,
+        "recommended_scale_from_camera_path": recommended_scale_from_path,
+        "step_distances": step_summary,
+        "warnings": warnings,
+    }
+    report_path = reports_dir / "scene_scale_pose_diagnostics.json"
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+    try:
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        order = np.arange(len(camera_positions))
+        sc = axes[0].scatter(camera_positions[:, 0], camera_positions[:, 2], c=order, cmap="viridis", s=8)
+        axes[0].plot(camera_positions[0, 0], camera_positions[0, 2], "go", ms=8, label="start")
+        axes[0].plot(camera_positions[-1, 0], camera_positions[-1, 2], "rs", ms=8, label="end")
+        axes[0].set_title("Camera trajectory X-Z")
+        axes[0].set_aspect("equal")
+        axes[0].legend()
+        plt.colorbar(sc, ax=axes[0], label="frame index")
+        if len(camera_positions) > 1:
+            distances = np.linalg.norm(np.diff(camera_positions, axis=0), axis=1)
+            axes[1].plot(distances, lw=0.8)
+            axes[1].axhline(step_summary["robust_jump_threshold"], color="red", ls="--", lw=1)
+        axes[1].set_title("Adjacent camera step distance")
+        axes[1].set_xlabel("step")
+        axes[1].set_ylabel("distance")
+        fig.tight_layout()
+        preview_path = reports_dir / "scene_scale_pose_diagnostics.png"
+        fig.savefig(preview_path, dpi=140)
+        plt.close(fig)
+        print(f"Saved preview: {preview_path}")
+    except Exception as exc:
+        print(f"Skipping scene diagnostics plot: {exc!r}")
+
+    return report
+
+
+scene_scale_pose_diagnostics = diagnose_scene_scale_and_poses(config)
+"""))
+
+cells.append(md(r"""
 # 16. gsplat Training
 
 Builds the training command from `config.gsplat_command_template`.
@@ -2704,12 +2862,20 @@ def build_gsplat_training_command(config):
             f"--data_dir {Path(config.vggt_scene_dir)} "
             f"--result_dir {train_dir}"
         )
+    save_steps = getattr(config, "gsplat_save_steps", None)
+    if save_steps is None:
+        save_steps = [int(config.gsplat_iterations)]
+    save_steps = sorted({int(step) for step in save_steps if int(step) > 0 and int(step) <= int(config.gsplat_iterations)})
+    if int(config.gsplat_iterations) not in save_steps:
+        save_steps.append(int(config.gsplat_iterations))
+    save_steps_arg = ",".join(str(step) for step in save_steps)
     return config.gsplat_command_template.format(
         dataset_dir=str(dataset_dir),
         train_dir=str(train_dir),
         iterations=int(config.gsplat_iterations),
         points_ply=str(points_ply),
         repo_dir=str(repo_dir),
+        save_steps=save_steps_arg,
     )
 
 
@@ -2812,6 +2978,9 @@ def debug_pipeline_state(config):
     depth_files = sorted((Path(config.da3_output_dir) / "depth").glob("depth_*.npy"))
     conf_files = sorted((Path(config.da3_output_dir) / "confidence").glob("conf_*.npy"))
     geometry_reports = sorted(Path(config.reports_dir).glob("*.json"))
+    scene_preview = Path(config.reports_dir) / "scene_scale_pose_diagnostics.png"
+    gaussian_diagnostics = Path(config.gsplat_train_dir) / "gaussian_diagnostics.json"
+    checkpoint_summary = Path(config.gsplat_train_dir) / "checkpoint_summary.json"
     result_ply = Path(config.result_ply_path)
     pointcloud_variants = [
         Path(config.pointcloud_dir) / "init_points.ply",
@@ -2827,6 +2996,9 @@ def debug_pipeline_state(config):
         "init_points_ply_exists": (Path(config.pointcloud_dir) / "init_points.ply").exists(),
         "transforms_json_frame_count": len(transforms.get("frames", [])) if isinstance(transforms, dict) else None,
         "geometry_reports": [str(path) for path in geometry_reports],
+        "scene_scale_pose_preview": str(scene_preview) if scene_preview.exists() else None,
+        "gaussian_diagnostics": load_json(gaussian_diagnostics),
+        "checkpoint_summary": load_json(checkpoint_summary),
         "train_ply_candidates": [str(p) for p in find_train_ply_candidates(config.gsplat_train_dir)],
         "result_ply_exists": result_ply.exists(),
         "result_ply_size_mb": result_ply.stat().st_size / (1024 * 1024) if result_ply.exists() else None,
@@ -2868,6 +3040,7 @@ def export_final_gaussian_ply(config):
         "confidence_threshold": float(config.confidence_threshold),
         "geometry_reports_dir": str(config.reports_dir),
         "gsplat_iterations": int(config.gsplat_iterations),
+        "gsplat_save_steps": list(getattr(config, "gsplat_save_steps", []) or []),
         "source_ply_path": str(source),
         "result_ply_path": str(result),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -2887,6 +3060,9 @@ def package_and_download_result(config):
     metadata = result_dir / "metadata.json"
     cameras = Path(config.da3_output_dir) / "cameras.json"
     geometry_reports = sorted(Path(config.reports_dir).glob("*.json"))
+    scene_preview = Path(config.reports_dir) / "scene_scale_pose_diagnostics.png"
+    gaussian_diagnostics = Path(config.gsplat_train_dir) / "gaussian_diagnostics.json"
+    checkpoint_summary = Path(config.gsplat_train_dir) / "checkpoint_summary.json"
     pointcloud_variants = [
         Path(config.pointcloud_dir) / "init_points.ply",
         Path(config.pointcloud_dir) / "init_points_multiview_unfiltered.ply",
@@ -2909,6 +3085,10 @@ def package_and_download_result(config):
         zf.write(cameras, "cameras.json")
         zf.write(config_snapshot, "config_snapshot.json")
         zf.write(train_log, "train.log")
+        for diagnostic_path in [gaussian_diagnostics, checkpoint_summary, scene_preview]:
+            if diagnostic_path.exists():
+                folder = "reports" if diagnostic_path.suffix.lower() in {".json", ".png"} else "artifacts"
+                zf.write(diagnostic_path, f"{folder}/{diagnostic_path.name}")
         for report_path in geometry_reports:
             zf.write(report_path, f"reports/{report_path.name}")
         for pointcloud_path in pointcloud_variants:

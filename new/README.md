@@ -37,6 +37,7 @@ RGB video
 -> wall-filtered and unfiltered point-cloud comparison outputs
 -> conservative initialization point cloud
 -> DA3-to-gsplat dataset conversion
+-> scene scale, pose, checkpoint, and Gaussian distribution diagnostics
 -> gsplat training
 -> Gaussian PLY export and ZIP packaging
 ```

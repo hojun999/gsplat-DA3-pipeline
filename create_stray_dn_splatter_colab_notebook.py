@@ -189,7 +189,7 @@ else:
 class PipelineConfig:
     use_drive: bool = True
     stray_export_source: Literal["drive_path", "upload_zip"] = "drive_path"
-    stray_export_path: str = "/content/drive/MyDrive/capstone_3dgs_project/input/stray_scanner/scan_export"
+    stray_export_path: str = "/content/drive/MyDrive/capstone_3dgs_project/input/stray_scanner/260603_test_001"
     job_id: str = "stray_room_001"
     scene_name: str = "stray_room_001"
 
@@ -201,11 +201,12 @@ class PipelineConfig:
 
     min_translation_baseline_m: float = 0.04
     min_rotation_baseline_deg: float = 3.0
-    max_frames: Optional[int] = 240
+    quick_mode: bool = True
+    max_frames: Optional[int] = 500
 
-    depth_min_m: float = 0.20
-    depth_max_m: float = 5.0
-    min_valid_depth_ratio: float = 0.20
+    depth_min_m: float = 0.30
+    depth_max_m: float = 8.0
+    min_valid_depth_ratio: float = 0.15
     min_confidence_ratio: float = 0.20
 
     stray_pose_convention: str = "stray_t_wc_camera_to_world"
@@ -228,14 +229,25 @@ class PipelineConfig:
 
     min_selected_frames: int = 24
     pointcloud_depth_stride: int = 8
-    pointcloud_max_points: int = 500000
-    pointcloud_min_confidence_value: int = 1
+    pointcloud_max_points: int = 1000000
+    pointcloud_min_confidence_value: int = 2
+    pointcloud_voxel_size_m: float = 0.03
     dn_splatter_depth_lambda: float = 0.2
     dn_splatter_depth_loss_type: str = "EdgeAwareLogL1"
     dn_splatter_use_normal_loss: bool = True
     dn_splatter_use_normal_tv_loss: bool = True
     checkpoint_every_iterations: int = 1000
     optional_colab_download: bool = False
+    enable_trajectory_preview: bool = True
+    strict_trajectory_check: bool = False
+    small_move_thresh_m: float = 0.01
+    large_jump_thresh_m: float = 0.50
+    max_allowed_jump_count: int = 5
+    large_rotation_thresh_deg: float = 30.0
+    max_allowed_rotation_jump_count: int = 5
+    rotation_only_move_thresh_m: float = 0.02
+    rotation_only_rot_thresh_deg: float = 10.0
+    main_axis_dominance_ratio: float = 1.5
 
     def resolve(self):
         if self.project_root is None:
@@ -253,6 +265,7 @@ class PipelineConfig:
         self.runtime_scratch_dir = str(scratch)
         self.rgb_extract_dir = str(scratch / "rgb_extracted")
         self.dn_dataset_dir = str(root / "data" / "dn_splatter" / self.job_id)
+        self.dataset_dir = self.dn_dataset_dir
         self.dn_output_dir = str(root / "outputs" / "dn_splatter" / self.job_id)
         self.gaussian_export_dir = str(root / "exports" / "gaussian_ply" / self.job_id)
         self.result_dir = str(Path(self.job_root) / "result_package")
@@ -267,18 +280,20 @@ class PipelineConfig:
 config = PipelineConfig(
     use_drive=USE_DRIVE,
     stray_export_source="drive_path",
-    stray_export_path="/content/drive/MyDrive/capstone_3dgs_project/input/stray_scanner/scan_export",
+    stray_export_path="/content/drive/MyDrive/capstone_3dgs_project/input/stray_scanner/260603_test_001",
     job_id="stray_room_001",
     scene_name="stray_room_001",
-    dn_splatter_max_num_iterations=7000,
-    max_frames=240,
+    quick_mode=True,
+    dn_splatter_max_num_iterations=3000,
+    max_frames=300,
     dry_run=True,
     resume=True,
 ).resolve()
 
 # Recommended A100 quality preset after the dry run and a short successful training:
-# config.dn_splatter_max_num_iterations = 30000
-# config.max_frames = 600  # Typically use 400 to 800 frames.
+# config.quick_mode = False
+# config.dn_splatter_max_num_iterations = 12000
+# config.max_frames = 600  # Typically use 500 to 700 frames.
 
 for path in [
     config.job_root,
@@ -1004,9 +1019,17 @@ def frame_depth_confidence_metrics(record, config):
     finite = np.isfinite(depth_m)
     valid_depth = finite & (depth_m >= config.depth_min_m) & (depth_m <= config.depth_max_m)
     valid_confidence = np.isfinite(confidence) & (confidence >= config.pointcloud_min_confidence_value)
+    valid_mask = valid_depth & valid_confidence
+    finite_valid_depths = depth_m[valid_depth]
     return {
         "valid_depth_ratio": float(np.mean(valid_depth)),
         "confidence_ratio": float(np.mean(valid_confidence)),
+        "high_confidence_ratio": float(np.mean(valid_confidence)),
+        "mean_confidence": float(np.mean(confidence[np.isfinite(confidence)])),
+        "median_depth": float(np.median(finite_valid_depths)) if finite_valid_depths.size else None,
+        "depth_nonzero_count": int(np.count_nonzero(depth_m > 0)),
+        "valid_mask_ratio": float(np.mean(valid_mask)),
+        "selection_score": float(np.mean(valid_depth) * 0.7 + np.mean(valid_confidence) * 0.3),
     }
 
 
@@ -1020,21 +1043,18 @@ def selected_sensor_candidate_limit(config):
 
 
 def select_rgb_pose_candidates(records, config):
-    print("[Steps 9-12] Filtering local RGB frames: blur -> similarity -> pose baseline -> candidate limit")
+    print("[Steps 9-12] Filtering local RGB/pose candidates before depth/confidence scoring")
     candidates = []
     rows = []
     last_selected_hash = None
     last_selected_pose = None
-    candidate_limit = selected_sensor_candidate_limit(config)
     for record in records:
         score = blur_score(record.rgb_path, config.blur_score_method)
         current_hash = phash_bits(record.rgb_path)
         similarity = similarity_score(last_selected_hash, current_hash, config.similarity_method)
         translation, rotation = pose_delta(last_selected_pose, record.pose_c2w)
         rejection_reason = None
-        if candidate_limit is not None and len(candidates) >= candidate_limit:
-            rejection_reason = "max_frames_limit"
-        elif score < config.min_blur_score:
+        if score < config.min_blur_score:
             rejection_reason = "blur_too_low"
         elif similarity is not None and similarity >= config.max_similarity:
             rejection_reason = "too_similar"
@@ -1050,6 +1070,13 @@ def select_rgb_pose_candidates(records, config):
             last_selected_pose = record.pose_c2w
         rows.append({
             "frame_id": record.frame_id,
+            "frame_id_label": f"frame_{record.frame_id:06d}",
+            "image_path": record.rgb_path,
+            "depth_path": record.depth_path,
+            "confidence_path": record.confidence_path,
+            "has_image": True,
+            "has_depth": True,
+            "has_confidence": True,
             "timestamp": record.timestamp,
             "blur_score": score,
             "similarity_score": similarity,
@@ -1057,9 +1084,15 @@ def select_rgb_pose_candidates(records, config):
             "rotation_from_last_selected_deg": rotation,
             "valid_depth_ratio": None,
             "confidence_ratio": None,
+            "high_confidence_ratio": None,
+            "mean_confidence": None,
+            "median_depth": None,
+            "depth_nonzero_count": None,
+            "selection_score": None,
             "candidate_selected": is_candidate,
             "selected": False,
             "rejection_reason": rejection_reason,
+            "reject_reason": rejection_reason,
             "required_data_error": None,
         })
     print(f"RGB/pose candidates selected for sensor caching: {len(candidates)}")
@@ -1137,12 +1170,21 @@ def cache_candidate_sensor_frames(records, config):
 def finalize_sensor_candidates(candidates, rows, config):
     failures = cache_candidate_sensor_frames(candidates, config)
     row_by_frame_id = {row["frame_id"]: row for row in rows}
-    selected = []
+    eligible = []
     for record in candidates:
         row = row_by_frame_id[record.frame_id]
         rejection_reason = None
         required_data_error = failures.get(record.frame_id)
-        metrics = {"valid_depth_ratio": None, "confidence_ratio": None}
+        metrics = {
+            "valid_depth_ratio": None,
+            "confidence_ratio": None,
+            "high_confidence_ratio": None,
+            "mean_confidence": None,
+            "median_depth": None,
+            "depth_nonzero_count": None,
+            "valid_mask_ratio": None,
+            "selection_score": None,
+        }
         if required_data_error is not None:
             rejection_reason = "missing_required_data"
         else:
@@ -1152,23 +1194,73 @@ def finalize_sensor_candidates(candidates, rows, config):
                     rejection_reason = "invalid_depth"
                 elif metrics["confidence_ratio"] < config.min_confidence_ratio:
                     rejection_reason = "invalid_confidence"
-                elif config.max_frames is not None and len(selected) >= config.max_frames:
-                    rejection_reason = "max_frames_limit"
             except Exception as exc:
                 rejection_reason = "missing_required_data"
                 required_data_error = str(exc)
                 print(f"Skipping unreadable required-data frame {record.frame_id}: {exc}")
-        is_selected = rejection_reason is None
-        if is_selected:
-            selected.append(record)
+        is_eligible = rejection_reason is None
+        if is_eligible:
+            eligible.append(record)
         row.update({
             "valid_depth_ratio": metrics["valid_depth_ratio"],
             "confidence_ratio": metrics["confidence_ratio"],
-            "selected": is_selected,
+            "high_confidence_ratio": metrics["high_confidence_ratio"],
+            "mean_confidence": metrics["mean_confidence"],
+            "median_depth": metrics["median_depth"],
+            "depth_nonzero_count": metrics["depth_nonzero_count"],
+            "valid_mask_ratio": metrics["valid_mask_ratio"],
+            "selection_score": metrics["selection_score"],
+            "depth_path": record.depth_path,
+            "confidence_path": record.confidence_path,
+            "selected": False,
             "rejection_reason": rejection_reason,
+            "reject_reason": rejection_reason,
             "required_data_error": required_data_error,
         })
+    selected_ids = select_balanced_scored_frame_ids(eligible, row_by_frame_id, config)
+    selected = []
+    for record in eligible:
+        row = row_by_frame_id[record.frame_id]
+        if record.frame_id in selected_ids:
+            row["selected"] = True
+            row["rejection_reason"] = None
+            row["reject_reason"] = None
+            selected.append(record)
+        else:
+            row["selected"] = False
+            row["rejection_reason"] = "max_frames_limit"
+            row["reject_reason"] = "max_frames_limit"
     return selected, rows
+
+
+def select_balanced_scored_frame_ids(eligible_records, row_by_frame_id, config):
+    if config.max_frames is None or len(eligible_records) <= int(config.max_frames):
+        return {record.frame_id for record in eligible_records}
+    target = int(config.max_frames)
+    ordered = sorted(eligible_records, key=lambda record: record.frame_id)
+    bins = np.array_split(np.arange(len(ordered)), target)
+    selected_ids = []
+    for bin_indices in bins:
+        if len(bin_indices) == 0:
+            continue
+        center = int(bin_indices[len(bin_indices) // 2])
+        best = max(
+            ((int(index), ordered[int(index)]) for index in bin_indices),
+            key=lambda record: (
+                row_by_frame_id[record[1].frame_id]["selection_score"],
+                -abs(center - record[0]),
+            ),
+        )[1]
+        selected_ids.append(best.frame_id)
+    if len(selected_ids) < target:
+        already = set(selected_ids)
+        remaining = sorted(
+            (record for record in eligible_records if record.frame_id not in already),
+            key=lambda record: row_by_frame_id[record.frame_id]["selection_score"],
+            reverse=True,
+        )
+        selected_ids.extend(record.frame_id for record in remaining[: target - len(selected_ids)])
+    return set(selected_ids[:target])
 
 
 def filter_frames(records, config):
@@ -1176,6 +1268,13 @@ def filter_frames(records, config):
     selected, rows = finalize_sensor_candidates(candidates, rows, config)
     missing_required_rows = [{
         "frame_id": frame_id,
+        "frame_id_label": f"frame_{frame_id:06d}",
+        "image_path": None,
+        "depth_path": None,
+        "confidence_path": None,
+        "has_image": False,
+        "has_depth": False,
+        "has_confidence": False,
         "timestamp": None,
         "blur_score": None,
         "similarity_score": None,
@@ -1183,9 +1282,16 @@ def filter_frames(records, config):
         "rotation_from_last_selected_deg": None,
         "valid_depth_ratio": None,
         "confidence_ratio": None,
+        "high_confidence_ratio": None,
+        "mean_confidence": None,
+        "median_depth": None,
+        "depth_nonzero_count": None,
+        "valid_mask_ratio": None,
+        "selection_score": None,
         "candidate_selected": False,
         "selected": False,
         "rejection_reason": "missing_required_data",
+        "reject_reason": "missing_required_data",
         "required_data_error": "Frame could not be aligned because at least one required modality was absent or invalid.",
     } for frame_id in alignment_report["missing_required_data_frame_ids"]]
     report_rows = sorted(rows + missing_required_rows, key=lambda row: row["frame_id"])
@@ -1205,11 +1311,19 @@ def filter_frames(records, config):
             "min_translation_baseline_m": config.min_translation_baseline_m,
             "min_rotation_baseline_deg": config.min_rotation_baseline_deg,
             "max_frames": config.max_frames,
-            "selected_sensor_candidate_limit": selected_sensor_candidate_limit(config),
+            "selected_sensor_candidate_limit": None,
+            "max_frames_applied_after_depth_confidence_scoring": True,
+            "MIN_DEPTH_M": config.depth_min_m,
+            "MAX_DEPTH_M": config.depth_max_m,
+            "CONF_THRESH": config.pointcloud_min_confidence_value,
+            "MIN_VALID_DEPTH_RATIO": config.min_valid_depth_ratio,
+            "MIN_HIGH_CONF_RATIO": config.min_confidence_ratio,
+            "TARGET_MAX_FRAMES": config.max_frames,
         },
         "summary": {
             "total_aligned_frames": len(records),
             "total_candidate_frame_ids": len(report_rows),
+            "matched_frames": alignment_report["common_frame_id_count"],
             "rgb_pose_candidates_cached": len(candidates),
             "selected_frames": len(selected),
             "rejected_aligned_frames": len(records) - len(selected),
@@ -1224,6 +1338,28 @@ def filter_frames(records, config):
             "rotation_baseline_deg": summarize_numbers(
                 [row["rotation_from_last_selected_deg"] for row in rows]
             ),
+            "average_valid_depth_ratio": float(np.mean([
+                row["valid_depth_ratio"] for row in report_rows
+                if row["valid_depth_ratio"] is not None
+            ])) if any(row["valid_depth_ratio"] is not None for row in report_rows) else None,
+            "average_high_confidence_ratio": float(np.mean([
+                row["high_confidence_ratio"] for row in report_rows
+                if row["high_confidence_ratio"] is not None
+            ])) if any(row["high_confidence_ratio"] is not None for row in report_rows) else None,
+            "top_5_selected_frame_ids": [
+                row["frame_id_label"] for row in sorted(
+                    [row for row in report_rows if row["selected"]],
+                    key=lambda row: row["selection_score"] if row["selection_score"] is not None else -1,
+                    reverse=True,
+                )[:5]
+            ],
+            "bottom_5_rejected_frame_ids_with_reason": [
+                {"frame_id": row["frame_id_label"], "reject_reason": row["reject_reason"]}
+                for row in sorted(
+                    [row for row in report_rows if not row["selected"]],
+                    key=lambda row: row["selection_score"] if row["selection_score"] is not None else -1,
+                )[:5]
+            ],
         },
         "frames": report_rows,
     }
@@ -1393,6 +1529,13 @@ def build_depth_initial_pointcloud(records, config, output_path):
         colors_parts.append(rgb_colors.astype(np.uint8))
     points = np.concatenate(points_parts, axis=0)
     colors = np.concatenate(colors_parts, axis=0)
+    if config.pointcloud_voxel_size_m and config.pointcloud_voxel_size_m > 0 and len(points):
+        voxel = float(config.pointcloud_voxel_size_m)
+        voxel_keys = np.floor(points / voxel).astype(np.int64)
+        _, unique_indices = np.unique(voxel_keys, axis=0, return_index=True)
+        points = points[unique_indices]
+        colors = colors[unique_indices]
+        print("Voxel downsampled PLY points:", len(points), "voxel_size_m:", voxel)
     if len(points) > config.pointcloud_max_points:
         rng = np.random.default_rng(42)
         indices = rng.choice(len(points), size=config.pointcloud_max_points, replace=False)
@@ -1406,12 +1549,588 @@ def build_depth_initial_pointcloud(records, config, output_path):
     return len(points)
 
 
+def reset_selected_dataset_outputs(dataset_dir):
+    dataset_dir = Path(dataset_dir)
+    for name in ["images", "depths", "depth", "confidence"]:
+        path = dataset_dir / name
+        if path.exists():
+            shutil.rmtree(path)
+    for name in [
+        "transforms.json",
+        "sparse_pointcloud.ply",
+        "stray_depth_init_points.ply",
+        "selected_frames_manifest.json",
+        "selected_frames_manifest.csv",
+    ]:
+        path = dataset_dir / name
+        if path.exists():
+            path.unlink()
+
+
+def write_selected_frames_manifest(dataset_dir, frames, report_rows, config, pointcloud_path, point_count):
+    dataset_dir = Path(dataset_dir)
+    selected_ids = {frame["stray_frame_id"] for frame in frames}
+    rows_by_id = {row["frame_id"]: dict(row) for row in report_rows}
+    manifest_frames = []
+    for frame_id in sorted(rows_by_id):
+        row = rows_by_id[frame_id]
+        frame_label = f"frame_{frame_id:06d}"
+        if frame_id in selected_ids:
+            row["image_path"] = f"images/{frame_label}.jpg"
+            row["depth_path"] = f"depths/{frame_label}.png"
+            row["confidence_path"] = f"confidence/{frame_label}.png"
+            row["has_image"] = True
+            row["has_depth"] = True
+            row["has_confidence"] = True
+        row["reject_reason"] = None if row.get("selected") else row.get("reject_reason") or row.get("rejection_reason")
+        manifest_frames.append(row)
+    payload = {
+        "total_frames": len(report_rows),
+        "matched_frames": alignment_report["common_frame_id_count"],
+        "selected_frames": len(selected_ids),
+        "rejected_frames": len(report_rows) - len(selected_ids),
+        "source_of_truth": "selected frame_id values in this manifest",
+        "selection_config": {
+            "MIN_DEPTH_M": config.depth_min_m,
+            "MAX_DEPTH_M": config.depth_max_m,
+            "CONF_THRESH": config.pointcloud_min_confidence_value,
+            "MIN_VALID_DEPTH_RATIO": config.min_valid_depth_ratio,
+            "MIN_HIGH_CONF_RATIO": config.min_confidence_ratio,
+            "TARGET_MAX_FRAMES": config.max_frames,
+            "QUICK_MODE": config.quick_mode,
+            "MAX_ITER": config.dn_splatter_max_num_iterations,
+            "POINT_STRIDE": config.pointcloud_depth_stride,
+            "MAX_POINTS": config.pointcloud_max_points,
+            "VOXEL_SIZE": config.pointcloud_voxel_size_m,
+        },
+        "sparse_pointcloud_path": str(Path(pointcloud_path).relative_to(dataset_dir)).replace("\\", "/"),
+        "sparse_pointcloud_points": point_count,
+        "frames": manifest_frames,
+    }
+    manifest_json_path = write_json(dataset_dir / "selected_frames_manifest.json", payload)
+    manifest_csv_path = dataset_dir / "selected_frames_manifest.csv"
+    pd.DataFrame(manifest_frames).to_csv(manifest_csv_path, index=False)
+    print("Wrote CSV:", manifest_csv_path)
+    return manifest_json_path, manifest_csv_path, payload
+
+
+def rotation_angle_deg(R1, R2):
+    R_delta = R2 @ R1.T
+    value = (np.trace(R_delta) - 1.0) / 2.0
+    value = np.clip(value, -1.0, 1.0)
+    return float(np.degrees(np.arccos(value)))
+
+
+def summarize_array(values):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return {"mean": None, "median": None, "p95": None, "max": None}
+    return {
+        "mean": float(np.mean(values)),
+        "median": float(np.median(values)),
+        "p95": float(np.percentile(values, 95)),
+        "max": float(np.max(values)),
+    }
+
+
+def frame_id_from_transform_file_path(file_path):
+    stem = Path(file_path).stem
+    return stem if stem.startswith("frame_") else f"frame_{frame_id_from_path(stem):06d}"
+
+
+def extract_frame_id(path_or_name: str) -> str:
+    return Path(path_or_name).stem
+
+
+def sample_frame_ids_for_log(frame_ids, sample_size=5):
+    frame_ids = list(frame_ids)
+    if len(frame_ids) <= sample_size * 3:
+        return frame_ids
+    middle = len(frame_ids) // 2
+    half = sample_size // 2
+    middle_start = max(0, middle - half)
+    middle_end = min(len(frame_ids), middle_start + sample_size)
+    sampled = frame_ids[:sample_size] + frame_ids[middle_start:middle_end] + frame_ids[-sample_size:]
+    return list(dict.fromkeys(sampled))
+
+
+def validate_selected_frame_alignment(config, require_confidence=True):
+    dataset_dir = Path(config.dataset_dir)
+    images_dir = dataset_dir / "images"
+    depths_dir = dataset_dir / "depths"
+    confidence_dir = dataset_dir / "confidence"
+    transforms_path = dataset_dir / "transforms.json"
+    report_path = Path(config.result_dir) / "selected_frame_alignment_report.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print("=== Selected Frame Alignment Check ===")
+    print("dataset_dir:", dataset_dir)
+    missing_dirs = [
+        str(path) for path in [images_dir, depths_dir] + ([confidence_dir] if require_confidence else [])
+        if not path.is_dir()
+    ]
+    if missing_dirs:
+        report = {
+            "dataset_dir": str(dataset_dir),
+            "transforms_path": str(transforms_path),
+            "missing_dirs": missing_dirs,
+            "error": "Missing selected dataset directories.",
+        }
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        raise RuntimeError(
+            "Selected frame alignment failed: images/depths/confidence/transforms.json are not synchronized. "
+            "Check selected_frame_alignment_report.json."
+        )
+    if not transforms_path.exists():
+        report = {
+            "dataset_dir": str(dataset_dir),
+            "transforms_path": str(transforms_path),
+            "missing_dirs": missing_dirs,
+            "error": "Missing transforms.json in DN-Splatter dataset.",
+        }
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        raise RuntimeError("Missing transforms.json in DN-Splatter dataset.")
+
+    transforms = json.loads(transforms_path.read_text(encoding="utf-8"))
+    frames = transforms.get("frames", [])
+    if not frames:
+        report = {
+            "dataset_dir": str(dataset_dir),
+            "transforms_path": str(transforms_path),
+            "missing_dirs": missing_dirs,
+            "error": "transforms.json has no frames.",
+        }
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        raise RuntimeError("Selected frame alignment failed: transforms.json has no frames.")
+
+    image_files = sorted(images_dir.glob("*.jpg"))
+    depth_files = sorted(depths_dir.glob("*.png"))
+    confidence_files = sorted(confidence_dir.glob("*.png")) if confidence_dir.exists() else []
+    image_ids = {extract_frame_id(path.name) for path in image_files}
+    depth_ids = {extract_frame_id(path.name) for path in depth_files}
+    confidence_ids = {extract_frame_id(path.name) for path in confidence_files}
+
+    transform_ids = set()
+    missing_images = []
+    missing_depths = []
+    missing_confidence = []
+    path_mismatches = []
+    sample_rows = []
+    for index, frame in enumerate(frames):
+        file_path = frame.get("file_path")
+        depth_file_path = frame.get("depth_file_path")
+        confidence_file_path = frame.get("confidence_file_path")
+        if not file_path or not depth_file_path or (require_confidence and not confidence_file_path):
+            path_mismatches.append({
+                "index": index,
+                "reason": "missing required path key",
+                "file_path": file_path,
+                "depth_file_path": depth_file_path,
+                "confidence_file_path": confidence_file_path,
+            })
+            continue
+        image_id = extract_frame_id(file_path)
+        depth_id = extract_frame_id(depth_file_path)
+        confidence_id = extract_frame_id(confidence_file_path) if confidence_file_path else None
+        transform_ids.add(image_id)
+        if Path(file_path).parts[0] != "images":
+            path_mismatches.append({"frame_id": image_id, "reason": "file_path is not under images/", "path": file_path})
+        if Path(depth_file_path).parts[0] != "depths":
+            path_mismatches.append({"frame_id": image_id, "reason": "depth_file_path is not under depths/", "path": depth_file_path})
+        if require_confidence and Path(confidence_file_path).parts[0] != "confidence":
+            path_mismatches.append({
+                "frame_id": image_id,
+                "reason": "confidence_file_path is not under confidence/",
+                "path": confidence_file_path,
+            })
+        if image_id != depth_id:
+            path_mismatches.append({
+                "frame_id": image_id,
+                "reason": "image/depth frame_id mismatch",
+                "file_path": file_path,
+                "depth_file_path": depth_file_path,
+            })
+        if require_confidence and image_id != confidence_id:
+            path_mismatches.append({
+                "frame_id": image_id,
+                "reason": "image/confidence frame_id mismatch",
+                "file_path": file_path,
+                "confidence_file_path": confidence_file_path,
+            })
+        image_abs = dataset_dir / file_path
+        depth_abs = dataset_dir / depth_file_path
+        confidence_abs = dataset_dir / confidence_file_path if confidence_file_path else None
+        if not image_abs.exists():
+            missing_images.append(image_id)
+        if not depth_abs.exists():
+            missing_depths.append(image_id)
+        if require_confidence and not confidence_abs.exists():
+            missing_confidence.append(image_id)
+        sample_rows.append({
+            "frame_id": image_id,
+            "image": file_path,
+            "depth": depth_file_path,
+            "confidence": confidence_file_path,
+        })
+
+    extra_images = sorted(image_ids - transform_ids)
+    extra_depths = sorted(depth_ids - transform_ids)
+    extra_confidence = sorted(confidence_ids - transform_ids) if require_confidence else []
+    missing_image_ids = sorted(transform_ids - image_ids)
+    missing_depth_ids = sorted(transform_ids - depth_ids)
+    missing_confidence_ids = sorted(transform_ids - confidence_ids) if require_confidence else []
+    all_counts_match = (
+        len(image_files) == len(depth_files) == len(frames)
+        and (not require_confidence or len(confidence_files) == len(frames))
+    )
+    all_frame_ids_match = (
+        image_ids == depth_ids == transform_ids
+        and (not require_confidence or confidence_ids == transform_ids)
+    )
+    checked_frame_ids_sample = sample_frame_ids_for_log(sorted(transform_ids))
+    sample_by_id = {row["frame_id"]: row for row in sample_rows}
+    report = {
+        "dataset_dir": str(dataset_dir),
+        "transforms_path": str(transforms_path),
+        "image_count": len(image_files),
+        "depth_count": len(depth_files),
+        "confidence_count": len(confidence_files),
+        "transform_frame_count": len(frames),
+        "require_confidence": require_confidence,
+        "all_counts_match": all_counts_match,
+        "all_frame_ids_match": all_frame_ids_match,
+        "missing_images": sorted(set(missing_images) | set(missing_image_ids)),
+        "missing_depths": sorted(set(missing_depths) | set(missing_depth_ids)),
+        "missing_confidence": sorted(set(missing_confidence) | set(missing_confidence_ids)),
+        "extra_images": extra_images,
+        "extra_depths": extra_depths,
+        "extra_confidence": extra_confidence,
+        "path_mismatch_count": len(path_mismatches),
+        "path_mismatches": path_mismatches[:50],
+        "checked_frame_ids_sample": checked_frame_ids_sample,
+    }
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"images count      : {report['image_count']}")
+    print(f"depths count      : {report['depth_count']}")
+    print(f"confidence count  : {report['confidence_count']}")
+    print(f"transforms frames : {report['transform_frame_count']}")
+    for frame_id in checked_frame_ids_sample:
+        row = sample_by_id.get(frame_id)
+        if row:
+            print(f"[OK] {frame_id}")
+            print(f"  image      : {row['image']}")
+            print(f"  depth      : {row['depth']}")
+            if require_confidence:
+                print(f"  confidence : {row['confidence']}")
+    print("Selected frame alignment report:", report_path)
+    failed = (
+        not all_counts_match
+        or not all_frame_ids_match
+        or report["missing_images"]
+        or report["missing_depths"]
+        or (require_confidence and report["missing_confidence"])
+        or extra_images
+        or extra_depths
+        or (require_confidence and extra_confidence)
+        or path_mismatches
+    )
+    if failed:
+        print(json.dumps({key: report[key] for key in [
+            "missing_images", "missing_depths", "missing_confidence",
+            "extra_images", "extra_depths", "extra_confidence", "path_mismatch_count",
+        ]}, indent=2))
+        raise RuntimeError(
+            "Selected frame alignment failed: images/depths/confidence/transforms.json are not synchronized. "
+            "Check selected_frame_alignment_report.json."
+        )
+    return report
+
+
+def preview_selected_trajectory(config):
+    import matplotlib.pyplot as plt
+
+    transforms_path = Path(config.dataset_dir) / "transforms.json"
+    if not transforms_path.exists():
+        raise FileNotFoundError(f"Missing selected transforms.json for trajectory preview: {transforms_path}")
+    transforms = json.loads(transforms_path.read_text(encoding="utf-8"))
+    frames = transforms.get("frames", [])
+    frame_ids = [frame_id_from_transform_file_path(frame["file_path"]) for frame in frames]
+    matrices = [np.asarray(frame["transform_matrix"], dtype=np.float64) for frame in frames]
+    positions = np.asarray([matrix[:3, 3] for matrix in matrices], dtype=np.float64)
+    rotations = [matrix[:3, :3] for matrix in matrices]
+    frame_count = len(frames)
+    middle_index = frame_count // 2 if frame_count else 0
+    step_deltas = np.linalg.norm(np.diff(positions, axis=0), axis=1) if frame_count > 1 else np.asarray([])
+    rotation_deltas = np.asarray(
+        [rotation_angle_deg(rotations[index - 1], rotations[index]) for index in range(1, frame_count)],
+        dtype=np.float64,
+    )
+    path_length_m = float(np.sum(step_deltas)) if step_deltas.size else 0.0
+    straight_distance_m = (
+        float(np.linalg.norm(positions[-1] - positions[0]))
+        if frame_count >= 2 and np.isfinite(positions).all()
+        else 0.0
+    )
+    path_to_straight_ratio = path_length_m / max(straight_distance_m, 1e-6)
+    axis_ranges_values = (
+        positions.max(axis=0) - positions.min(axis=0)
+        if frame_count and np.isfinite(positions).all()
+        else np.asarray([np.nan, np.nan, np.nan])
+    )
+    axis_names = ["X", "Y", "Z"]
+    finite_axis_ranges = np.isfinite(axis_ranges_values)
+    main_axis = (
+        axis_names[int(np.nanargmax(axis_ranges_values))]
+        if frame_count and finite_axis_ranges.any()
+        else None
+    )
+    sorted_ranges = np.sort(axis_ranges_values[np.isfinite(axis_ranges_values)])
+    dominance = (
+        float(sorted_ranges[-1] / max(sorted_ranges[-2], 1e-6))
+        if sorted_ranges.size >= 2
+        else None
+    )
+    large_jump_indices = np.where(step_deltas > config.large_jump_thresh_m)[0]
+    large_rotation_indices = np.where(rotation_deltas > config.large_rotation_thresh_deg)[0]
+    rotation_only_indices = np.where(
+        (step_deltas < config.rotation_only_move_thresh_m)
+        & (rotation_deltas > config.rotation_only_rot_thresh_deg)
+    )[0] if step_deltas.size and rotation_deltas.size else np.asarray([], dtype=np.int64)
+    small_movement_count = int(np.sum(step_deltas < config.small_move_thresh_m)) if step_deltas.size else 0
+    small_movement_ratio = float(small_movement_count / len(step_deltas)) if step_deltas.size else 0.0
+
+    warnings = []
+    if frame_count < config.min_selected_frames:
+        warnings.append("Selected trajectory has fewer frames than min_selected_frames.")
+    if frame_count and not np.isfinite(positions).all():
+        warnings.append("NaN or Inf camera positions detected.")
+    if path_length_m <= 0:
+        warnings.append("Trajectory path length is zero or negative.")
+    if len(large_jump_indices) > 0:
+        warnings.append("Large translation jumps detected.")
+    if len(large_rotation_indices) > 0:
+        warnings.append("Large rotation jumps detected.")
+    if step_deltas.size and len(rotation_only_indices) / len(step_deltas) >= 0.20:
+        warnings.append("Rotation-only candidates are at least 20% of selected frame pairs.")
+    if dominance is not None and dominance < config.main_axis_dominance_ratio:
+        warnings.append("Main movement axis is not dominant. Trajectory may be noisy, curved, or multi-corridor.")
+
+    trajectory_log_dir = Path(config.logs_dir) / "trajectory"
+    trajectory_log_dir.mkdir(parents=True, exist_ok=True)
+    plot_paths = {
+        "xyz_timeseries": trajectory_log_dir / "trajectory_xyz_timeseries.png",
+        "topdown_xz": trajectory_log_dir / "trajectory_topdown_xz.png",
+        "trajectory_3d": trajectory_log_dir / "trajectory_3d.png",
+        "step_delta": trajectory_log_dir / "trajectory_step_delta.png",
+        "rotation_delta": trajectory_log_dir / "trajectory_rotation_delta.png",
+    }
+
+    if frame_count:
+        indices = np.arange(frame_count)
+        plt.figure(figsize=(10, 5))
+        plt.plot(indices, positions[:, 0], label="X")
+        plt.plot(indices, positions[:, 1], label="Y")
+        plt.plot(indices, positions[:, 2], label="Z")
+        plt.title("Selected trajectory XYZ over frame index")
+        plt.xlabel("selected frame index")
+        plt.ylabel("position (m)")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plot_paths["xyz_timeseries"], dpi=150)
+        plt.close()
+
+        plt.figure(figsize=(6, 6))
+        plt.plot(positions[:, 0], positions[:, 2], marker=".", linewidth=1)
+        plt.scatter(positions[0, 0], positions[0, 2], color="green", label="start")
+        plt.scatter(positions[-1, 0], positions[-1, 2], color="red", label="end")
+        for index in large_jump_indices[:10]:
+            plt.scatter(positions[index + 1, 0], positions[index + 1, 2], color="orange", marker="x")
+        plt.title("Selected trajectory top-down X-Z")
+        plt.xlabel("X (m)")
+        plt.ylabel("Z (m)")
+        plt.legend()
+        plt.axis("equal")
+        plt.tight_layout()
+        plt.savefig(plot_paths["topdown_xz"], dpi=150)
+        plt.close()
+
+        fig = plt.figure(figsize=(7, 6))
+        ax = fig.add_subplot(111, projection="3d")
+        ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], marker=".", linewidth=1)
+        ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2], color="green", label="start")
+        ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], color="red", label="end")
+        ax.set_title("Selected camera trajectory 3D")
+        ax.set_xlabel("X (m)")
+        ax.set_ylabel("Y (m)")
+        ax.set_zlabel("Z (m)")
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(plot_paths["trajectory_3d"], dpi=150)
+        plt.close()
+
+    pair_indices = np.arange(len(step_deltas))
+    plt.figure(figsize=(10, 4))
+    plt.plot(pair_indices, step_deltas, linewidth=1)
+    plt.axhline(config.large_jump_thresh_m, color="red", linestyle="--", label="large jump threshold")
+    plt.title("Translation step delta")
+    plt.xlabel("selected frame pair index")
+    plt.ylabel("translation delta (m)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(plot_paths["step_delta"], dpi=150)
+    plt.close()
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(pair_indices, rotation_deltas, linewidth=1)
+    plt.axhline(config.large_rotation_thresh_deg, color="red", linestyle="--", label="large rotation threshold")
+    plt.title("Rotation step delta")
+    plt.xlabel("selected frame pair index")
+    plt.ylabel("rotation delta (deg)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(plot_paths["rotation_delta"], dpi=150)
+    plt.close()
+
+    def pair_rows(indices, value_array, formatter):
+        rows = []
+        for index in sorted(indices, key=lambda item: value_array[item], reverse=True)[:10]:
+            rows.append({
+                "from": frame_ids[int(index)],
+                "to": frame_ids[int(index) + 1],
+                "value": formatter(value_array[int(index)]),
+            })
+        return rows
+
+    large_jump_rows = pair_rows(large_jump_indices, step_deltas, lambda value: float(value))
+    large_rotation_rows = pair_rows(large_rotation_indices, rotation_deltas, lambda value: float(value))
+    rotation_only_rows = [
+        {
+            "from": frame_ids[int(index)],
+            "to": frame_ids[int(index) + 1],
+            "move_m": float(step_deltas[int(index)]),
+            "rotation_deg": float(rotation_deltas[int(index)]),
+        }
+        for index in sorted(rotation_only_indices, key=lambda item: rotation_deltas[item], reverse=True)[:10]
+    ]
+    report = {
+        "transforms_path": str(transforms_path),
+        "frame_count": frame_count,
+        "first_frame_id": frame_ids[0] if frame_ids else None,
+        "middle_frame_id": frame_ids[middle_index] if frame_ids else None,
+        "last_frame_id": frame_ids[-1] if frame_ids else None,
+        "axis_ranges": {
+            "x": float(axis_ranges_values[0]) if np.isfinite(axis_ranges_values[0]) else None,
+            "y": float(axis_ranges_values[1]) if np.isfinite(axis_ranges_values[1]) else None,
+            "z": float(axis_ranges_values[2]) if np.isfinite(axis_ranges_values[2]) else None,
+        },
+        "main_axis": main_axis,
+        "main_axis_dominance": dominance,
+        "path_length_m": path_length_m,
+        "straight_distance_m": straight_distance_m,
+        "path_to_straight_ratio": float(path_to_straight_ratio),
+        "step_delta_m": summarize_array(step_deltas),
+        "rotation_delta_deg": summarize_array(rotation_deltas),
+        "small_movement_count": small_movement_count,
+        "small_movement_ratio": small_movement_ratio,
+        "large_jump_count": int(len(large_jump_indices)),
+        "large_rotation_jump_count": int(len(large_rotation_indices)),
+        "rotation_only_count": int(len(rotation_only_indices)),
+        "large_jump_candidates": large_jump_rows,
+        "large_rotation_jump_candidates": large_rotation_rows,
+        "rotation_only_candidates": rotation_only_rows,
+        "warnings": warnings,
+        "plot_paths": {key: str(value) for key, value in plot_paths.items()},
+    }
+
+    result_dir = Path(config.result_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    report_json_path = result_dir / "trajectory_sanity_report.json"
+    report_txt_path = result_dir / "trajectory_sanity_report.txt"
+    report_json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    lines = [
+        "=== Selected Trajectory Preview / Sanity Check ===",
+        f"transforms.json: {transforms_path}",
+        f"selected frame count: {frame_count}",
+        "",
+        f"first frame : {report['first_frame_id']}",
+        f"middle frame: {report['middle_frame_id']}",
+        f"last frame  : {report['last_frame_id']}",
+        "",
+        f"X range: min={positions[:, 0].min() if frame_count else None} max={positions[:, 0].max() if frame_count else None} range={report['axis_ranges']['x']} m",
+        f"Y range: min={positions[:, 1].min() if frame_count else None} max={positions[:, 1].max() if frame_count else None} range={report['axis_ranges']['y']} m",
+        f"Z range: min={positions[:, 2].min() if frame_count else None} max={positions[:, 2].max() if frame_count else None} range={report['axis_ranges']['z']} m",
+        "",
+        f"estimated main movement axis: {main_axis}",
+        f"path length: {path_length_m:.4f} m",
+        f"straight distance: {straight_distance_m:.4f} m",
+        f"path / straight ratio: {path_to_straight_ratio:.4f}",
+        "",
+        "step delta:",
+        f"mean={report['step_delta_m']['mean']} m",
+        f"median={report['step_delta_m']['median']} m",
+        f"p95={report['step_delta_m']['p95']} m",
+        f"max={report['step_delta_m']['max']} m",
+        f"small movement ratio={small_movement_ratio * 100:.2f} %",
+        f"large jumps > {config.large_jump_thresh_m} m: {len(large_jump_indices)} count",
+        "",
+        "rotation delta:",
+        f"mean={report['rotation_delta_deg']['mean']} deg",
+        f"median={report['rotation_delta_deg']['median']} deg",
+        f"p95={report['rotation_delta_deg']['p95']} deg",
+        f"max={report['rotation_delta_deg']['max']} deg",
+        f"large rotation jumps > {config.large_rotation_thresh_deg} deg: {len(large_rotation_indices)} count",
+        "",
+        "rotation-only candidates:",
+        f"move < {config.rotation_only_move_thresh_m} m and rotation > {config.rotation_only_rot_thresh_deg} deg: {len(rotation_only_indices)} count",
+    ]
+    if large_jump_rows:
+        lines.extend(["", "Large translation jump candidates:"])
+        lines.extend([f"{row['from']} -> {row['to']} : {row['value']:.4f} m" for row in large_jump_rows])
+    if large_rotation_rows:
+        lines.extend(["", "Large rotation jump candidates:"])
+        lines.extend([f"{row['from']} -> {row['to']} : {row['value']:.2f} deg" for row in large_rotation_rows])
+    if rotation_only_rows:
+        lines.extend(["", "Rotation-only candidates:"])
+        lines.extend([
+            f"{row['from']} -> {row['to']} : move={row['move_m']:.4f} m, rot={row['rotation_deg']:.2f} deg"
+            for row in rotation_only_rows
+        ])
+    if warnings:
+        lines.extend(["", "Warnings:"])
+        lines.extend([f"- {warning}" for warning in warnings])
+    lines.extend(["", f"Report JSON: {report_json_path}", f"Report TXT: {report_txt_path}"])
+    report_text = "\n".join(lines)
+    report_txt_path.write_text(report_text, encoding="utf-8")
+    print(report_text)
+
+    strict_failures = []
+    if frame_count < config.min_selected_frames:
+        strict_failures.append("frame_count < min_selected_frames")
+    if frame_count and not np.isfinite(positions).all():
+        strict_failures.append("positions contain NaN or Inf")
+    if path_length_m <= 0:
+        strict_failures.append("path_length_m <= 0")
+    if len(large_jump_indices) > config.max_allowed_jump_count:
+        strict_failures.append("large_jump_count > max_allowed_jump_count")
+    if len(large_rotation_indices) > config.max_allowed_rotation_jump_count:
+        strict_failures.append("large_rotation_jump_count > max_allowed_rotation_jump_count")
+    if config.strict_trajectory_check and strict_failures:
+        raise RuntimeError(
+            "Trajectory sanity check failed before sparse point cloud generation. "
+            "Check trajectory_sanity_report.json and trajectory plots. "
+            f"Failures: {strict_failures}"
+        )
+    return report
+
+
 def create_dn_splatter_dataset(records, config):
     dataset_dir = Path(config.dn_dataset_dir)
     if dataset_dir.exists() and config.overwrite:
         shutil.rmtree(dataset_dir)
+    reset_selected_dataset_outputs(dataset_dir)
     images_dir = dataset_dir / "images"
-    depth_dir = dataset_dir / "depth"
+    depth_dir = dataset_dir / "depths"
     confidence_dir = dataset_dir / "confidence"
     for path in [images_dir, depth_dir, confidence_dir]:
         path.mkdir(parents=True, exist_ok=True)
@@ -1442,8 +2161,7 @@ def create_dn_splatter_dataset(records, config):
             "w": record.width,
             "h": record.height,
         })
-    pointcloud_path = dataset_dir / "stray_depth_init_points.ply"
-    point_count = build_depth_initial_pointcloud(records, config, pointcloud_path)
+    pointcloud_path = dataset_dir / "sparse_pointcloud.ply"
     transforms = {
         "camera_model": "OPENCV",
         "depth_unit_scale_factor": config.depth_unit_scale_factor,
@@ -1453,15 +2171,43 @@ def create_dn_splatter_dataset(records, config):
         "frames": frames,
     }
     transforms_path = write_json(dataset_dir / "transforms.json", transforms)
+    selected_alignment_report = validate_selected_frame_alignment(config, require_confidence=True)
+    if config.enable_trajectory_preview:
+        trajectory_report = preview_selected_trajectory(config)
+    else:
+        trajectory_report = None
+        print("Trajectory preview disabled.")
+    point_count = build_depth_initial_pointcloud(records, config, pointcloud_path)
+    manifest_json_path, manifest_csv_path, selected_manifest = write_selected_frames_manifest(
+        dataset_dir,
+        frames,
+        frame_filter_report["frames"],
+        config,
+        pointcloud_path,
+        point_count,
+    )
     manifest = {
         "dataset_dir": str(dataset_dir),
         "transforms_path": str(transforms_path),
+        "selected_frames_manifest_json": str(manifest_json_path),
+        "selected_frames_manifest_csv": str(manifest_csv_path),
+        "selected_frame_alignment_report_json": str(Path(config.result_dir) / "selected_frame_alignment_report.json"),
+        "trajectory_sanity_report_json": str(Path(config.result_dir) / "trajectory_sanity_report.json")
+        if trajectory_report is not None else None,
         "selected_frame_count": len(records),
         "image_count": len(list(images_dir.glob("*.jpg"))),
         "depth_count": len(list(depth_dir.glob("*.png"))),
         "confidence_count": len(list(confidence_dir.glob("*.png"))),
         "initial_pointcloud_path": str(pointcloud_path),
         "initial_pointcloud_points": point_count,
+        "selected_frame_alignment": {
+            "all_counts_match": selected_alignment_report["all_counts_match"],
+            "all_frame_ids_match": selected_alignment_report["all_frame_ids_match"],
+            "path_mismatch_count": selected_alignment_report["path_mismatch_count"],
+        },
+        "selected_frame_ids": [
+            frame["frame_id_label"] for frame in selected_manifest["frames"] if frame["selected"]
+        ],
         "dn_splatter_parser": "normal-nerfstudio",
         "dn_depth_key": "depth_file_path",
         "confidence_note": (
@@ -1635,7 +2381,51 @@ def build_dn_train_command(config, dataset_dir):
     return shlex.join(args)
 
 
+def sanity_check_selected_dataset(dataset_dir):
+    dataset_dir = Path(dataset_dir)
+    manifest = json.loads((dataset_dir / "selected_frames_manifest.json").read_text(encoding="utf-8"))
+    transforms = json.loads((dataset_dir / "transforms.json").read_text(encoding="utf-8"))
+    selected_frame_ids = {
+        int(row["frame_id"]) for row in manifest["frames"] if row.get("selected")
+    }
+    transform_frame_ids = {
+        int(frame["stray_frame_id"]) for frame in transforms.get("frames", [])
+    }
+    image_count = len(list((dataset_dir / "images").glob("*.jpg")))
+    depth_count = len(list((dataset_dir / "depths").glob("*.png")))
+    confidence_count = len(list((dataset_dir / "confidence").glob("*.png")))
+    transform_count = len(transforms.get("frames", []))
+    pointcloud_path = dataset_dir / manifest["sparse_pointcloud_path"]
+    point_count = 0
+    if pointcloud_path.exists():
+        with open(pointcloud_path, "rb") as handle:
+            for raw_line in handle:
+                line = raw_line.decode("ascii", errors="ignore").strip()
+                if line.startswith("element vertex "):
+                    point_count = int(line.split()[-1])
+                if line == "end_header":
+                    break
+    report = {
+        "selected_image_count": image_count,
+        "selected_depth_count": depth_count,
+        "selected_confidence_count": confidence_count,
+        "transforms_frame_count": transform_count,
+        "sparse_pointcloud_point_count": point_count,
+        "selected_manifest_count": len(selected_frame_ids),
+        "frame_id_sets_match": selected_frame_ids == transform_frame_ids,
+    }
+    print(json.dumps(report, indent=2))
+    if not (image_count == depth_count == confidence_count == transform_count == len(selected_frame_ids)):
+        raise RuntimeError(f"Selected dataset count mismatch before DN-Splatter training: {report}")
+    if selected_frame_ids != transform_frame_ids:
+        raise RuntimeError("transforms.json frame ids do not match selected_frames_manifest.json.")
+    if point_count <= 0:
+        raise RuntimeError("sparse_pointcloud.ply is empty or missing before DN-Splatter training.")
+    return report
+
+
 print("[Step 17] Building DN-Splatter training command")
+selected_dataset_sanity_report = sanity_check_selected_dataset(dn_dataset_dir)
 train_command = build_dn_train_command(config, dn_dataset_dir)
 print(train_command)
 if config.dry_run:
@@ -1699,6 +2489,7 @@ training_validation_report = {
     "dry_run": config.dry_run,
     "training_executed": not config.dry_run,
     "training_command": train_command,
+    "selected_dataset_sanity_report": selected_dataset_sanity_report,
     "training_config_path": str(training_config_path) if training_config_path else None,
     "checkpoint_count": len(checkpoint_paths),
     "checkpoints": checkpoint_paths,
@@ -1740,6 +2531,16 @@ def package_results(config, gaussian_ply_path, transforms_path):
             raise RuntimeError(f"Missing required report before packaging: {source}")
         shutil.copy2(source, staging_dir / name)
     shutil.copy2(transforms_path, staging_dir / "transforms.json")
+    dataset_dir = Path(config.dn_dataset_dir)
+    for name in ["selected_frames_manifest.json", "selected_frames_manifest.csv", "sparse_pointcloud.ply"]:
+        source = dataset_dir / name
+        if not source.exists():
+            raise RuntimeError(f"Missing selected dataset artifact before packaging: {source}")
+        shutil.copy2(source, staging_dir / name)
+    for name in ["selected_frame_alignment_report.json", "trajectory_sanity_report.json", "trajectory_sanity_report.txt"]:
+        source = Path(config.result_dir) / name
+        if source.exists():
+            shutil.copy2(source, staging_dir / name)
     logs_target = staging_dir / "logs"
     if Path(config.logs_dir).exists():
         shutil.copytree(config.logs_dir, logs_target, dirs_exist_ok=True)
@@ -1793,10 +2594,12 @@ Persistent project outputs:
 capstone_3dgs_project/
   data/dn_splatter/<job_id>/
     images/
-    depth/
+    depths/
     confidence/
     transforms.json
-    stray_depth_init_points.ply
+    sparse_pointcloud.ply
+    selected_frames_manifest.json
+    selected_frames_manifest.csv
   outputs/dn_splatter/<job_id>/
     ... DN-Splatter checkpoints and config.yml ...
   exports/gaussian_ply/<job_id>/

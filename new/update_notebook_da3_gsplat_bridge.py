@@ -325,6 +325,7 @@ class DA3Dataset:
 
     da3_entry_code = r"""
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -335,6 +336,130 @@ import simple_trainer
 
 
 FINAL_GAUSSIAN_NOTE = "This is a 3DGS Gaussian PLY, not a triangle mesh PLY."
+
+
+def parse_save_steps(value: str, iterations: int):
+    if not value:
+        return [int(iterations)]
+    steps = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        step = int(item)
+        if step > 0 and step <= int(iterations):
+            steps.append(step)
+    steps = sorted(set(steps))
+    if int(iterations) not in steps:
+        steps.append(int(iterations))
+    return steps
+
+
+def tensor_summary(tensor):
+    tensor = tensor.detach()
+    if tensor.numel() == 0:
+        return {"count": 0}
+    values = tensor.float().reshape(-1)
+    finite = torch.isfinite(values)
+    finite_values = values[finite]
+    result = {
+        "count": int(values.numel()),
+        "finite_count": int(finite.sum().item()),
+        "non_finite_count": int((~finite).sum().item()),
+    }
+    if finite_values.numel() == 0:
+        return result
+    quantiles = torch.quantile(
+        finite_values,
+        torch.tensor([0.01, 0.05, 0.5, 0.95, 0.99], device=finite_values.device),
+    )
+    result.update(
+        {
+            "min": float(finite_values.min().item()),
+            "max": float(finite_values.max().item()),
+            "mean": float(finite_values.mean().item()),
+            "p01": float(quantiles[0].item()),
+            "p05": float(quantiles[1].item()),
+            "median": float(quantiles[2].item()),
+            "p95": float(quantiles[3].item()),
+            "p99": float(quantiles[4].item()),
+        }
+    )
+    return result
+
+
+def vector_tensor_summary(tensor):
+    tensor = tensor.detach().float()
+    finite_rows = torch.isfinite(tensor).all(dim=1)
+    result = {
+        "count": int(tensor.shape[0]),
+        "finite_count": int(finite_rows.sum().item()),
+        "non_finite_count": int((~finite_rows).sum().item()),
+    }
+    if finite_rows.sum().item() == 0:
+        return result
+    values = tensor[finite_rows]
+    result.update(
+        {
+            "min": values.min(dim=0).values.cpu().tolist(),
+            "max": values.max(dim=0).values.cpu().tolist(),
+            "range": (values.max(dim=0).values - values.min(dim=0).values).cpu().tolist(),
+            "center": values.mean(dim=0).cpu().tolist(),
+        }
+    )
+    return result
+
+
+def write_checkpoint_summary(train_dir: Path):
+    patterns = ["**/*.ckpt", "**/*.pt", "**/*.pth", "**/*.pth.tar"]
+    checkpoints = []
+    for pattern in patterns:
+        checkpoints.extend(path for path in train_dir.glob(pattern) if path.is_file())
+    checkpoints = sorted(set(checkpoints), key=lambda path: path.stat().st_mtime, reverse=True)
+    summary = [
+        {
+            "path": str(path),
+            "size_mb": path.stat().st_size / (1024 * 1024),
+            "modified_time": path.stat().st_mtime,
+        }
+        for path in checkpoints
+    ]
+    out_path = train_dir / "checkpoint_summary.json"
+    out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"Checkpoint candidates: {len(summary)}")
+    if summary:
+        print(f"Latest checkpoint: {summary[0]['path']}")
+    return summary
+
+
+def write_gaussian_diagnostics(runner, train_dir: Path, final_ply: Path):
+    splats = runner.splats
+    means = splats["means"].detach().float()
+    scales = splats["scales"].detach().float()
+    opacities = splats["opacities"].detach().float()
+    if opacities.numel() and bool((opacities.min() < 0).item()):
+        opacity_values = torch.sigmoid(opacities)
+        opacity_interpretation = "sigmoid_logits"
+    else:
+        opacity_values = opacities
+        opacity_interpretation = "direct"
+    scales_are_logits = bool((scales.min() < 0).item()) if scales.numel() else False
+    scale_norm = torch.linalg.norm(torch.exp(scales) if scales_are_logits else scales, dim=1)
+    report = {
+        "final_ply": str(final_ply),
+        "gaussian_count": int(means.shape[0]),
+        "means": vector_tensor_summary(means),
+        "raw_scales": tensor_summary(scales),
+        "scale_norm": tensor_summary(scale_norm),
+        "opacities": tensor_summary(opacity_values),
+        "opacity_interpretation": opacity_interpretation,
+        "non_finite_gaussian_rows": int((~torch.isfinite(means).all(dim=1)).sum().item()),
+    }
+    out_path = train_dir / "gaussian_diagnostics.json"
+    out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print("Gaussian diagnostics:")
+    print(json.dumps(report, indent=2))
+    return report
 
 
 def export_final_gaussian_ply(runner, save_to: Path) -> None:
@@ -385,6 +510,11 @@ def main():
     parser.add_argument("--test-every", type=int, default=8)
     parser.add_argument("--data-factor", type=int, default=1)
     parser.add_argument(
+        "--save-steps",
+        default=None,
+        help="Comma-separated checkpoint save steps. The final iteration is always included.",
+    )
+    parser.add_argument(
         "--final-ply",
         default=None,
         help="Explicit gsplat.export_splats output path. Defaults to <train-dir>/ply/gaussians.ply.",
@@ -415,13 +545,29 @@ def main():
     cfg.batch_size = 1
     cfg.max_steps = int(args.iterations)
     cfg.eval_steps = []
-    cfg.save_steps = [int(args.iterations)]
+    cfg.save_steps = parse_save_steps(args.save_steps, int(args.iterations))
     cfg.save_ply = False
     cfg.ply_steps = []
     cfg.init_type = "sfm"
     cfg.normalize_world_space = False
     cfg.load_exposure = False
     cfg.depth_loss = False
+
+    parser_probe = DA3Parser(str(dataset_dir), factor=int(args.data_factor), normalize=False, test_every=max(1, int(args.test_every)))
+    print(
+        json.dumps(
+            {
+                "scene_scale": float(parser_probe.scene_scale),
+                "normalize_world_space": bool(cfg.normalize_world_space),
+                "auto_scale_poses": False,
+                "save_steps": cfg.save_steps,
+                "point_count": int(parser_probe.points.shape[0]),
+                "camera_count": int(len(parser_probe.image_names)),
+            },
+            indent=2,
+        )
+    )
+    del parser_probe
 
     runner = simple_trainer.Runner(local_rank=0, world_rank=0, world_size=1, cfg=cfg)
     runner.train()
@@ -430,6 +576,8 @@ def main():
             runner.export_ppisp_reports()
         except Exception as exc:
             print(f"Skipping optional ppisp report export: {exc!r}")
+    write_checkpoint_summary(train_dir)
+    write_gaussian_diagnostics(runner, train_dir, final_ply)
     export_final_gaussian_ply(runner, final_ply)
 
 
@@ -453,7 +601,8 @@ if __name__ == "__main__":
         "--dataset-dir {dataset_dir} "
         "--train-dir {train_dir} "
         "--iterations {iterations} "
-        "--points-ply {points_ply}"
+        "--points-ply {points_ply} "
+        "--save-steps {save_steps}"
     )
 
     print("DA3 gsplat bridge written:")
